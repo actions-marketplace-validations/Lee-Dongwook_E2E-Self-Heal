@@ -2,12 +2,14 @@
 
 import difflib
 import json
+import os
 import subprocess
 from pathlib import Path
 
 import structlog
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.table import Table
@@ -89,6 +91,26 @@ def main(
     raise typer.Exit(code=0)
 
 
+def _chdir_root(root: Path | None) -> None:
+    """Anchor relative path resolution and subprocess cwd to ``root`` when provided.
+
+    Programmatic integrators (e.g. a Playwright Reporter) may invoke the CLI from an
+    arbitrary working directory; ``--root`` is the explicit equivalent of the shell
+    wrapper's ``cd $working-directory`` (Issue #301). When omitted, the current directory
+    is used, preserving existing behavior.
+    """
+    if root is None:
+        return
+    if not root.is_dir():
+        console.print(f"[red]--root is not a directory:[/red] {escape(str(root))}")
+        raise typer.Exit(code=2)
+    # Resolve the sandbox boundary against the ORIGINAL cwd before chdir, so a relative
+    # workspace_root (the default ".") is not silently redefined to --root (Issue #301
+    # review): the boundary must stay where the process started, not follow --root.
+    settings.workspace_root = str(Path(settings.workspace_root).expanduser().resolve())
+    os.chdir(root)
+
+
 def _read_diff(diff_file: Path | None, diff_base: str | None) -> str:
     if diff_file is not None:
         assert_read_allowed(diff_file)
@@ -118,7 +140,7 @@ def _read_diff(diff_file: Path | None, diff_base: str | None) -> str:
         )
         console.print(
             Panel(
-                f"{detail}\n\n"
+                f"{escape(detail)}\n\n"
                 "Check that --diff-base is a valid ref and that this is a git repository.",
                 title="Cannot read git diff",
                 border_style="red",
@@ -234,6 +256,7 @@ def _heal_suite(
     if passed:
         return SuiteSummary(total_failed=0, healed=0, is_success=True)
     results: list[RepairSummary] = []
+    result_by_rel: dict[str, RepairSummary] = {}
     for rel in scan_failing_tests(raw_log):
         path = Path(rel)
         # Targets parsed from reporter output are untrusted: require them to resolve inside
@@ -245,23 +268,54 @@ def _heal_suite(
             logger.warning("failing_test_sandbox_denied", path=rel, error=str(exc))
             # Keep the denied failure visible as an unresolved suite result rather than
             # silently dropping it, so the suite is not reported as fully healed.
-            results.append(RepairSummary(test_script_path=rel, is_success=False, loop_count=0))
+            result = RepairSummary(test_script_path=rel, is_success=False, loop_count=0)
+            results.append(result)
+            result_by_rel[rel] = result
             continue
         # Use the validated canonical path for all filesystem access; keep the
         # workspace-relative value only for logging/display.
         if not resolved.exists():
             logger.warning("failing_test_not_found", path=rel)
+            # Keep missing targets unresolved so suite totals remain accurate (#212).
+            result = RepairSummary(test_script_path=rel, is_success=False, loop_count=0)
+            results.append(result)
+            result_by_rel[rel] = result
             continue
         rerun_passed, focused_log = run_playwright(str(resolved))
         if rerun_passed:
-            results.append(RepairSummary(test_script_path=rel, is_success=True, loop_count=0))
+            result = RepairSummary(test_script_path=rel, is_success=True, loop_count=0)
+            results.append(result)
+            result_by_rel[rel] = result
             continue
-        results.append(_heal_file(resolved, focused_log, dom_diff_context, dry_run, memory_enabled))
+        result = _heal_file(resolved, focused_log, dom_diff_context, dry_run, memory_enabled)
+        results.append(result)
+        result_by_rel[rel] = result
+
+    # Require a full-suite pass; dry runs are unverified previews (#212).
+    final_passed = not dry_run
+    if final_passed and results:
+        final_passed, final_log = run_playwright(suite_target)
+        if not final_passed:
+            # Preserve scanner order for deterministic JSON and notifications.
+            final_failing = scan_failing_tests(final_log)
+            if final_failing:
+                for rel in final_failing:
+                    if rel in result_by_rel:
+                        result_by_rel[rel].is_success = False
+                    else:
+                        result = RepairSummary(test_script_path=rel, is_success=False, loop_count=0)
+                        results.append(result)
+                        result_by_rel[rel] = result
+            else:
+                # An unparseable final failure invalidates all repairs (#212).
+                for result in results:
+                    result.is_success = False
+
     healed = sum(1 for r in results if r.is_success)
     return SuiteSummary(
         total_failed=len(results),
         healed=healed,
-        is_success=len(results) > 0 and healed == len(results),
+        is_success=len(results) > 0 and healed == len(results) and final_passed,
         results=results,
     )
 
@@ -346,6 +400,11 @@ def heal(
     test_path: Path | None = typer.Argument(
         None, help="failing test file; a directory or omitting it heals the whole suite"
     ),
+    root: Path | None = typer.Option(
+        None,
+        "--root",
+        help="project root anchoring relative paths and subprocess cwd; defaults to the current directory",
+    ),
     log_file: Path | None = typer.Option(
         None, "--log", help="raw Playwright failure log (single-file mode); else the test is run"
     ),
@@ -383,13 +442,14 @@ def heal(
     ``workspace_root`` in every mode except ``off`` (Issue #211).
     """
     configure_logging(settings.log_level)
+    _chdir_root(root)
     try:
         if app_url is not None:
             settings.app_url = app_url
         if test_path is not None:
             assert_read_allowed(test_path)
             if not test_path.exists():
-                console.print(f"[red]path not found:[/red] {test_path}")
+                console.print(f"[red]path not found:[/red] {escape(str(test_path))}")
                 raise typer.Exit(code=2)
 
         # Parse and validate selector hint FIRST (Issue #119)
@@ -404,7 +464,7 @@ def heal(
                     original=parsed_hint.original,
                 )
             except Exception as e:
-                console.print(f"[red]Invalid --selector-hint JSON:[/red] {e}")
+                console.print(f"[red]Invalid --selector-hint JSON:[/red] {escape(str(e))}")
                 raise typer.Exit(code=2)
 
         dom_diff_context = [d.model_dump() for d in analyze_diff(_read_diff(diff_file, diff_base))]
@@ -450,14 +510,16 @@ def heal(
             dry_run,
             memory_enabled,
         )
+        # Emit JSON before early exits.
+        if json_output:
+            typer.echo(suite.model_dump_json())
+
         if suite.total_failed == 0 and suite.is_success:
             console.print("[green]suite passes[/green] — nothing to heal")
             raise typer.Exit(code=0)
         if suite.total_failed == 0:
             console.print("[yellow]suite failed but no test files could be parsed/found[/yellow]")
             raise typer.Exit(code=1)
-        if json_output:
-            typer.echo(suite.model_dump_json())
 
         # Notify Slack for each result in suite (Issue #124)
         for res in suite.results:
@@ -466,13 +528,18 @@ def heal(
         console.print(f"[bold]{suite.healed}/{suite.total_failed}[/bold] test(s) healed")
         raise typer.Exit(code=0 if suite.is_success else 1)
     except SandboxViolation as exc:
-        console.print(f"[red]sandbox denied:[/red] {exc}")
+        console.print(f"[red]sandbox denied:[/red] {escape(str(exc))}")
         raise typer.Exit(code=2) from exc
 
 
 @app.command()
 def review(
     test_path: Path = typer.Argument(..., help="failing test file to review (never modified)"),
+    root: Path | None = typer.Option(
+        None,
+        "--root",
+        help="project root anchoring relative paths and subprocess cwd; defaults to the current directory",
+    ),
     log_file: Path | None = typer.Option(
         None, "--log", help="raw Playwright failure log; else the test is run to produce one"
     ),
@@ -488,10 +555,11 @@ def review(
 ) -> None:
     """Review a failing test and suggest source-level fixes as PR comments — never edits it."""
     configure_logging(settings.log_level)
+    _chdir_root(root)
     try:
         assert_read_allowed(test_path)
         if not test_path.exists():
-            console.print(f"[red]path not found:[/red] {test_path}")
+            console.print(f"[red]path not found:[/red] {escape(str(test_path))}")
             raise typer.Exit(code=2)
 
         dom_diff_context = [d.model_dump() for d in analyze_diff(_read_diff(diff_file, diff_base))]
@@ -508,13 +576,13 @@ def review(
         if json_output:
             typer.echo(report.model_dump_json())
         if not report.is_complete:
-            console.print(f"[red]review incomplete:[/red] {report.error}")
+            console.print(f"[red]review incomplete:[/red] {escape(str(report.error))}")
             raise typer.Exit(code=1)
         _render_findings(report)
         console.print(f"[bold]{len(report.findings)}[/bold] source-level suggestion(s)")
         raise typer.Exit(code=0)
     except SandboxViolation as exc:
-        console.print(f"[red]sandbox denied:[/red] {exc}")
+        console.print(f"[red]sandbox denied:[/red] {escape(str(exc))}")
         raise typer.Exit(code=2) from exc
 
 
@@ -673,7 +741,7 @@ jobs:
                     f"[green]Successfully scaffolded starter workflow at {WORKFLOW_TARGET_PATH}![/green]"
                 )
             except Exception as e:
-                console.print(f"[red]Failed to write workflow file: {e}[/red]")
+                console.print(f"[red]Failed to write workflow file: {escape(str(e))}[/red]")
                 raise typer.Exit(code=1)
 
     raise typer.Exit(code=exit_code)
