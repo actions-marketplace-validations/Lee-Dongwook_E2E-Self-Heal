@@ -1,4 +1,3 @@
-from langgraph.graph import END
 from app.graph import route_after_shadow
 from app.nodes.shadow_verifier import shadow_verifier
 from app.shadow.config import ShadowConfig
@@ -40,7 +39,8 @@ def test_shadow_verifier_skips_when_no_snapshot(tmp_path, monkeypatch):
 
     result = shadow_verifier(state)
 
-    assert result == {"shadow_report": {"ok": True, "skipped": True}}
+    assert result["shadow_report"] == {"ok": True, "skipped": True}
+    assert result["evidence_history"][-1]["outcome"] == "skipped"
     # Check that code on disk was not modified
     assert test_file.read_text(encoding="utf-8") == "console.log('original');"
 
@@ -99,10 +99,10 @@ def test_shadow_verifier_passes_on_successful_replay(tmp_path, monkeypatch):
 
     result = shadow_verifier(state)
 
-    assert result == {
-        "current_code": "console.log('patched');",
-        "shadow_report": {"ok": True, "score": 100.0},
-    }
+    assert result["current_code"] == "console.log('patched');"
+    assert result["shadow_report"] == {"ok": True, "score": 100.0}
+    assert result["evidence_candidates"] == []
+    assert result["evidence_history"][-1]["details"]["score"] == 100.0
     # The patched code is kept on disk for further stages
     assert test_file.read_text(encoding="utf-8") == "console.log('patched');"
 
@@ -252,7 +252,8 @@ def test_shadow_verifier_reverts_on_placeholder_result(tmp_path, monkeypatch):
 
     result = shadow_verifier(state)
 
-    assert result == {"shadow_report": {"ok": True, "skipped": True}}
+    assert result["shadow_report"] == {"ok": True, "skipped": True}
+    assert result["evidence_history"][-1]["outcome"] == "skipped"
     # Check that disk is reverted to original_code
     assert test_file.read_text(encoding="utf-8") == "console.log('original');"
 
@@ -292,7 +293,7 @@ def test_route_after_shadow():
     }
     assert route_after_shadow(state_fail) == "patch_generator"
 
-    # 3. Failed, loop_count at cap -> END
+    # 3. Failed, loop_count at cap -> refusal finalizer
     state_cap: AgentState = {
         "test_script_path": "",
         "original_code": "",
@@ -307,4 +308,4 @@ def test_route_after_shadow():
         "loop_count": 3,
         "is_success": False,
     }
-    assert route_after_shadow(state_cap) == END
+    assert route_after_shadow(state_cap) == "refusal_finalizer"
