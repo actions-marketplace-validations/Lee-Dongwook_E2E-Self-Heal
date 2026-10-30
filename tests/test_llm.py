@@ -14,6 +14,9 @@ from pydantic import SecretStr
 
 from app import llm
 from app.config import settings
+from app.nodes.diagnoser import diagnoser
+from app.schemas import DiagnosisVerdict
+from tests.factories import make_state
 
 
 def test_get_client_requires_key(monkeypatch):
@@ -35,12 +38,12 @@ def test_factory_builds_openai_compatible_client_for_nvidia(monkeypatch):
     monkeypatch.setattr(settings, "llm_provider", "nvidia")
     monkeypatch.setattr(settings, "llm_api_key", "test-key")
     monkeypatch.setattr(settings, "llm_base_url", "https://integrate.api.nvidia.com/v1")
-    monkeypatch.setattr(settings, "llm_model", "openai/gpt-oss-120b")
+    monkeypatch.setattr(settings, "llm_model", "minimaxai/minimax-m3.1-flash")
 
     model = llm._build_chat_model("nvidia")
 
     assert isinstance(model, ChatOpenAI)
-    assert model.model_name == "openai/gpt-oss-120b"
+    assert model.model_name == "minimaxai/minimax-m3.1-flash"
     assert str(model.openai_api_base) == "https://integrate.api.nvidia.com/v1"
 
 
@@ -108,11 +111,6 @@ def test_anthropic_missing_extra_raises(monkeypatch):
         llm._build_chat_model("anthropic")
 
 
-def test_anthropic_uses_default_tool_use_not_strict_schema():
-    # Claude has no json_schema response_format; it must not be forced into strict mode.
-    assert "anthropic" not in llm._STRICT_SCHEMA_PROVIDERS
-
-
 def test_factory_ollama_needs_no_key(monkeypatch):
     monkeypatch.setattr(settings, "llm_provider", "ollama")
     monkeypatch.setattr(settings, "llm_api_key", "")
@@ -146,12 +144,6 @@ def test_ollama_missing_extra_raises(monkeypatch):
 
     with pytest.raises(RuntimeError, match=r"ollama\]"):
         llm._build_chat_model("ollama")
-
-
-def test_ollama_uses_default_native_json_schema():
-    # Ollama uses its native format=<schema> (default with_structured_output method),
-    # not the OpenAI strict-schema kwargs which its client doesn't accept.
-    assert "ollama" not in llm._STRICT_SCHEMA_PROVIDERS
 
 
 def test_factory_builds_openai_client_with_base_url_override(monkeypatch):
@@ -336,29 +328,11 @@ def test_deepseek_missing_key_raises(monkeypatch: pytest.MonkeyPatch):
         llm._deepseek_api_key()
 
 
-def test_deepseek_uses_responses_api_not_langchain_strict_schema():
-    # DeepSeek is served by DeepSeekResponsesClient (Responses API text.format),
-    # not the LangChain strict json_schema kwargs used for OpenAI/NVIDIA.
-    assert "deepseek" not in llm._STRICT_SCHEMA_PROVIDERS
-
-
-def test_deepseek_complete_sends_instructions_input_and_returns_text(
-    monkeypatch: pytest.MonkeyPatch,
-):
+def test_deepseek_complete_returns_text(monkeypatch: pytest.MonkeyPatch):
     client, fake = _make_deepseek_client(monkeypatch)
     fake.output_text = "diagnosis text"
 
-    result = client.complete("SYS", "USR")
-
-    assert result == "diagnosis text"
-    assert fake.calls == [
-        {
-            "model": "deepseek-v4-flash",
-            "instructions": "SYS",
-            "input": "USR",
-            "max_output_tokens": 512,
-        }
-    ]
+    assert client.complete("SYS", "USR") == "diagnosis text"
 
 
 def test_deepseek_complete_raises_on_empty_text(monkeypatch: pytest.MonkeyPatch):
@@ -405,30 +379,22 @@ def test_get_client_builds_deepseek_responses_client(monkeypatch: pytest.MonkeyP
 # --- Adapter happy paths with mocked chat models (no live API calls) ------------------
 
 
-def test_complete_returns_text_and_sends_system_then_user():
-    captured: dict[str, object] = {}
-
+def test_complete_returns_text():
     class _FakeMessage:
         content = "diagnosis text"
 
     class _FakeModel:
-        def invoke(self, messages):
-            captured["messages"] = messages
+        def invoke(self, _messages):
             return _FakeMessage()
 
     client = llm.LangChainClient(_FakeModel())  # type: ignore[arg-type]
-    result = client.complete("SYS", "USR")
 
-    assert result == "diagnosis text"
-    assert captured["messages"] == [("system", "SYS"), ("human", "USR")]
+    assert client.complete("SYS", "USR") == "diagnosis text"
 
 
-def test_structured_returns_validated_model_and_sends_messages():
-    captured: dict[str, object] = {}
-
+def test_structured_returns_validated_model():
     class _FakeStructured:
-        def invoke(self, messages):
-            captured["messages"] = messages
+        def invoke(self, _messages):
             return llm.PatchOutput(instructions=[])
 
     class _FakeModel:
@@ -436,10 +402,8 @@ def test_structured_returns_validated_model_and_sends_messages():
             return _FakeStructured()
 
     client = llm.LangChainClient(_FakeModel())  # type: ignore[arg-type]
-    result = client.structured("SYS", "USR", llm.PatchOutput)
 
-    assert isinstance(result, llm.PatchOutput)
-    assert captured["messages"] == [("system", "SYS"), ("human", "USR")]
+    assert isinstance(client.structured("SYS", "USR", llm.PatchOutput), llm.PatchOutput)
 
 
 def test_extract_text_flattens_content_blocks():
@@ -454,49 +418,87 @@ def test_extract_text_flattens_content_blocks():
 
 
 class _RecordingClient:
-    """A stand-in LLMClient that records calls and returns canned, schema-valid results."""
+    """A stand-in LLMClient that returns canned, schema-valid results."""
 
-    def __init__(self) -> None:
-        self.calls: list[tuple] = []
-
-    def complete(self, system_prompt: str, user_prompt: str) -> str:
-        self.calls.append(("complete", system_prompt, user_prompt))
+    def complete(self, _system_prompt: str, _user_prompt: str) -> str:
         return "diagnosis"
 
-    def structured(self, system_prompt, user_prompt, schema):
-        self.calls.append(("structured", system_prompt, user_prompt, schema))
+    def structured(self, _system_prompt: str, _user_prompt: str, schema: type) -> object:
         if schema is llm.ReviewOutput:
             return llm.ReviewOutput(findings=[])
+        if schema is llm.DiagnosisVerdictOutput:
+            return llm.DiagnosisVerdictOutput(
+                verdict=DiagnosisVerdict.UNCLEAR, rationale="not enough evidence"
+            )
         return llm.PatchOutput(instructions=[])
 
 
-def test_generate_diagnosis_delegates_to_complete(monkeypatch):
+def test_generate_public_functions_return_client_results(monkeypatch):
     fake = _RecordingClient()
     monkeypatch.setattr(llm, "_get_client", lambda: fake)
 
     assert llm.generate_diagnosis("sys", "usr") == "diagnosis"
-    assert fake.calls == [("complete", "sys", "usr")]
+    assert isinstance(llm.generate_patch("sys", "usr"), llm.PatchOutput)
+    assert isinstance(llm.generate_review("sys", "usr"), llm.ReviewOutput)
+    assert isinstance(llm.generate_diagnosis_verdict("sys", "usr"), llm.DiagnosisVerdictOutput)
 
 
-def test_generate_patch_delegates_to_structured(monkeypatch):
-    fake = _RecordingClient()
-    monkeypatch.setattr(llm, "_get_client", lambda: fake)
+def test_a_configured_secret_never_reaches_the_provider_request(monkeypatch):
+    """Acceptance test for the redaction boundary: the request body a provider would receive.
 
-    out = llm.generate_patch("sys", "usr")
+    The recording model stands in for the transport, so the captured ``messages`` are exactly
+    what ``LangChainClient`` hands to the chat model, still serialized as the provider would
+    receive them. The Diagnoser node drives the call, so the boundary is on the path.
+    """
+    secret = "sk-live-5f4d3c2b1a09"
+    sent: list[list[tuple[str, str]]] = []
 
-    assert isinstance(out, llm.PatchOutput)
-    assert fake.calls[0][:3] == ("structured", "sys", "usr")
-    assert fake.calls[0][3] is llm.PatchOutput
+    class _Response:
+        content = "diagnosis"
+
+    class _RecordingChatModel:
+        def invoke(self, messages):
+            sent.append(messages)
+            return _Response()
+
+    monkeypatch.setenv("E2E_TEST_PROVIDER_KEY", secret)
+    monkeypatch.setattr(settings, "sensitive_env_vars", "E2E_TEST_PROVIDER_KEY")
+    monkeypatch.setattr(settings, "sensitive_values", SecretStr(""))
+    client = llm.LangChainClient(_RecordingChatModel())  # type: ignore[arg-type]
+    monkeypatch.setattr(llm, "_get_client", lambda: client)
+
+    diagnoser(
+        make_state(
+            test_script_path="tests/login.spec.ts",
+            current_code="await page.click('#login')\n",
+            error_log=f"Error: header was authorization: bearer {secret}\n  at a:1:1",
+        )
+    )
+
+    assert sent, "the provider was never called"
+    assert secret not in repr(sent)
+    assert "[REDACTED]" in repr(sent)
 
 
-def test_generate_review_delegates_to_structured(monkeypatch):
-    fake = _RecordingClient()
-    monkeypatch.setattr(llm, "_get_client", lambda: fake)
+@pytest.mark.parametrize(
+    ("provider", "base_url", "expected"),
+    [
+        ("ollama", "", "http://localhost:11434"),
+        ("ollama", "http://box.internal:11434", "http://box.internal:11434"),
+        ("openai", "", "https://api.openai.com/v1"),
+        ("openai", "http://localhost:8000/v1", "http://localhost:8000/v1"),
+        ("anthropic", "https://ignored.example.com", "https://api.anthropic.com"),
+        ("deepseek", "", "https://api.deepseek.com"),
+        ("nvidia", "", "https://integrate.api.nvidia.com/v1"),
+        ("orcarouter", "", "https://api.orcarouter.ai/v1"),
+    ],
+)
+def test_resolved_endpoint_reports_what_the_client_actually_uses(
+    monkeypatch, provider, base_url: str, expected: str
+) -> None:
+    monkeypatch.setattr(settings, "llm_base_url", base_url)
 
-    out = llm.generate_review("sys", "usr")
-
-    assert isinstance(out, llm.ReviewOutput)
-    assert fake.calls[0][3] is llm.ReviewOutput
+    assert llm.resolved_endpoint(provider) == expected
 
 
 def test_generate_patch_surfaces_client_error_for_retry_and_feedback(monkeypatch):

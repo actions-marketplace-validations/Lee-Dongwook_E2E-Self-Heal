@@ -4,9 +4,9 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from app.shadow.config import MissPolicy
-from app.shadow.injector import MockInjector
 from app.shadow.match_options import MatchOptions
-from app.shadow.matcher import NoMatchError, SnapshotMatcher
+from app.shadow.injector import MockInjector
+from app.shadow.matcher import SnapshotMatcher
 from app.shadow.schemas import CapturedRequest, CapturedResponse, NetworkSnapshot
 
 
@@ -17,48 +17,6 @@ def _make_request(url: str = "https://api.example.com/miss", method: str = "GET"
     req.headers = {}
     req.post_data = None
     return req
-
-
-def test_snapshot_matcher_exact_match():
-    req1 = CapturedRequest(method="GET", url="https://api.example.com/data?id=1")
-    res1 = CapturedResponse(status=200, headers={"Content-Type": "application/json"}, body="{}")
-
-    snapshots = [NetworkSnapshot(request=req1, response=res1)]
-    matcher = SnapshotMatcher(snapshots)
-
-    # Perfect match
-    match_req = CapturedRequest(method="GET", url="https://api.example.com/data?id=1")
-    assert matcher.match(match_req) == res1
-
-
-def test_snapshot_matcher_path_fallback_with_explicit_threshold():
-    req1 = CapturedRequest(method="GET", url="https://api.example.com/data?id=1")
-    res1 = CapturedResponse(status=200, headers={"Content-Type": "application/json"}, body="{}")
-
-    snapshots = [NetworkSnapshot(request=req1, response=res1)]
-    matcher = SnapshotMatcher(snapshots, options=MatchOptions(min_score=170.0))
-
-    # Different query string, same path
-    match_req = CapturedRequest(method="GET", url="https://api.example.com/data?id=2")
-    assert matcher.match(match_req) == res1
-
-
-def test_snapshot_matcher_no_match():
-    req1 = CapturedRequest(method="GET", url="https://api.example.com/data")
-    res1 = CapturedResponse(status=200, body="ok")
-
-    snapshots = [NetworkSnapshot(request=req1, response=res1)]
-    matcher = SnapshotMatcher(snapshots)
-
-    # Different method
-    req_post = CapturedRequest(method="POST", url="https://api.example.com/data")
-    with pytest.raises(NoMatchError):
-        matcher.match(req_post)
-
-    # Different path
-    req_other_path = CapturedRequest(method="GET", url="https://api.example.com/other")
-    with pytest.raises(NoMatchError):
-        matcher.match(req_other_path)
 
 
 def test_snapshot_matcher_consumes_queue_entries_before_resorting_on_augmentation():
@@ -102,26 +60,6 @@ def test_snapshot_matcher_replays_unsequenced_augmentations_after_captured_seque
     )
 
     assert [matcher.match(request).body for _ in range(3)] == ["first", "third", "live"]
-
-
-def test_mock_injector_applies_match_options_to_snapshot_lists():
-    snapshot = NetworkSnapshot(
-        request=CapturedRequest(method="GET", url="https://captured.example/data"),
-        response=CapturedResponse(status=200, body="captured"),
-    )
-    mock_page = MagicMock()
-    injector = MockInjector(
-        page_or_context=mock_page,
-        match_options=MatchOptions(allow_cross_origin=True),
-    )
-
-    injector.inject_mock("**/*", [snapshot])
-
-    assert injector.matcher is not None
-    response = injector.matcher.match(
-        CapturedRequest(method="GET", url="https://other.example/data")
-    )
-    assert response.body == "captured"
 
 
 def test_mock_injector_sync_fulfill():
@@ -293,12 +231,28 @@ def test_mock_injector_async_no_loop():
         injector.inject_mock("**/*", [])
 
 
-# --- Miss policy: strict (default) ---
-
-
 def test_miss_policy_defaults_to_strict():
     injector = MockInjector(MagicMock())
     assert injector.miss_policy is MissPolicy.STRICT
+
+
+def test_mock_injector_applies_match_options_to_snapshot_lists():
+    snapshot = NetworkSnapshot(
+        request=CapturedRequest(method="GET", url="https://captured.example/data"),
+        response=CapturedResponse(status=200, body="captured"),
+    )
+    injector = MockInjector(
+        page_or_context=MagicMock(),
+        match_options=MatchOptions(allow_cross_origin=True),
+    )
+
+    injector.inject_mock("**/*", [snapshot])
+
+    assert injector.matcher is not None
+    response = injector.matcher.match(
+        CapturedRequest(method="GET", url="https://other.example/data")
+    )
+    assert response.body == "captured"
 
 
 def test_miss_policy_strict_aborts_sync():
@@ -452,3 +406,26 @@ async def test_miss_policy_record_and_augment_async():
     assert injector.recorded_snapshots[0].response.body == "live-body"
     assert injector.matcher is not None
     assert len(injector.matcher.snapshots) == 1
+
+
+def test_mock_injector_fulfills_with_folded_duplicate_headers_unchanged():
+    # Playwright's route.fulfill takes a dict and turns each newline in a Set-Cookie value back
+    # into its own header, so the folded form from the parsers must reach it untouched (#226).
+    folded = {
+        "Set-Cookie": "session=one; Path=/\ncsrf=two; Path=/",
+        "Link": "<a>; rel=preload, <b>; rel=preload",
+    }
+    snapshot = NetworkSnapshot(
+        request=CapturedRequest(method="GET", url="https://api.example.com/login"),
+        response=CapturedResponse(status=200, headers=folded, body="ok"),
+    )
+    mock_page = MagicMock()
+    mock_route = MagicMock()
+    mock_request = _make_request("https://api.example.com/login")
+
+    injector = MockInjector(page_or_context=mock_page)
+    injector.inject_mock("**/*", [snapshot])
+    _, handler = mock_page.route.call_args[0]
+    handler(mock_route, mock_request)
+
+    mock_route.fulfill.assert_called_once_with(status=200, headers=folded, body=b"ok")

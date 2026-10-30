@@ -25,7 +25,10 @@ test until it passes (or a retry cap is hit) and writes the fix back — as a lo
 a **CI GitHub Action** that opens a patch PR.
 
 > **Scope guardrail:** the engine only fixes **failing locators and wait conditions**. It
-> never touches assertions or test logic, and every patch stays human-reviewable.
+> never touches assertions or test logic, and every patch stays human-reviewable. Every
+> candidate patch is also checked structurally with an AST lock: anything other than a
+> locator string, timeout, or wait method changing is rejected, and repeated rejections end in
+> a refusal at the loop cap.
 
 ### Two modes: **heal** and **review**
 
@@ -82,22 +85,38 @@ See [`docs/design.md`](docs/design.md) for the full design, and
 The flagship workflow: run your suite and auto-heal on failure, opening a patch PR for review:
 
 ```yaml
-- name: E2E self-heal
-  id: heal
-  uses: Lee-Dongwook/E2E-Self-Heal@v0.4.0
-  with:
-      test-path: tests/example.spec.ts
-      nvidia-api-key: ${{ secrets.NVIDIA_API_KEY }}
-      diff-base: ${{ github.event.pull_request.base.sha }}
-      app-url: http://localhost:4173 # optional: enables live selector verification
+permissions:
+    contents: write
+    pull-requests: write
+    id-token: write # required only when upload-url is set (OIDC to the product API)
 
-- name: Open patch PR
-  if: steps.heal.outputs.outcome == 'healed'
-  uses: peter-evans/create-pull-request@v6
-  with:
-      body-path: ${{ steps.heal.outputs.summary-path }}
-      branch: e2e-self-heal/${{ github.run_id }}
+jobs:
+    self-heal:
+        runs-on: ubuntu-latest
+        steps:
+            - name: E2E self-heal
+              id: heal
+              uses: Lee-Dongwook/E2E-Self-Heal@v0.4.0
+              with:
+                  test-path: tests/example.spec.ts
+                  nvidia-api-key: ${{ secrets.NVIDIA_API_KEY }}
+                  diff-base: ${{ github.event.pull_request.base.sha }}
+                  app-url: http://localhost:4173 # optional: live selector verification
+                  # upload-url: https://api.example.com # optional: POST result JSON to the product
+
+            - name: Open patch PR
+              if: steps.heal.outputs.outcome == 'healed'
+              uses: peter-evans/create-pull-request@v6
+              with:
+                  body-path: ${{ steps.heal.outputs.summary-path }}
+                  branch: e2e-self-heal/${{ github.run_id }}
 ```
+
+Set `upload-url` to your product API base URL to send `repair-summary.json` /
+`review.json` to `<upload-url>/v1/runs` via GitHub Actions OIDC. Leave it unset
+(default) for today's behaviour. Upload failures emit a `::warning::` and never
+change the job result or `outcome`. The job needs `permissions: id-token: write`
+when `upload-url` is set.
 
 The action's `outcome` output is `passed` \| `healed` \| `unhealed` (heal mode) or `reviewed`
 (review mode). For a Playwright suite in a subdirectory, pass `working-directory:`. A
@@ -198,7 +217,7 @@ e2e-healer tests/login.spec.ts
 
 Works with **NVIDIA NIM (default), OpenAI, Anthropic (Claude), DeepSeek, OrcaRouter, or a local Ollama model** —
 see [Configuration](#configuration) to pick one. For the default, get a free NVIDIA NIM API
-key at [build.nvidia.com](https://build.nvidia.com/) (default model `openai/gpt-oss-120b`).
+key at [build.nvidia.com](https://build.nvidia.com/) (default model `minimaxai/minimax-m3.1-flash`).
 
 <details>
 <summary>Development install from a local clone</summary>
@@ -250,7 +269,7 @@ Exit code is `0` when the test is healed, non-zero otherwise. `--json` prints a
 machine-readable summary to stdout (human output goes to stderr) so CI can branch on it:
 a `RepairSummary` for a successful single-file heal, a `RefusalReport` when it declines a
 single-file repair, a `SuiteSummary` for suite mode, and a `ReviewReport` in review mode.
-Every emitted summary is self-describing: it carries a `schema_version` (currently `"2.0"`)
+Every emitted summary is self-describing: it carries a `schema_version` (currently `"2.3"`)
 and a `kind` discriminator (`"repair"` / `"refusal"` / `"suite"` / `"review"`) so the CI
 wrapper can dispatch without guessing on keys. `e2e-healer <path>`
 is shorthand for `e2e-healer heal <path>`; `review` is a separate subcommand that emits a
@@ -259,6 +278,8 @@ CI wrapper branches on `has_findings`.
 
 Healing history is enabled by default. Pass `--no-memory` to fully bypass local history lookup
 and verified-repair storage for a run; pass `--memory` explicitly to enable the default behavior.
+A remembered repair only saves a model call: it is checked and verified like any other candidate,
+and a test the engine would refuse (for example an ambiguous target) is refused with or without it.
 
 ### Benchmark semantic-context token usage
 
@@ -270,6 +291,16 @@ metric, not a provider-billed-token statement. `tiktoken` may download this toke
 use, then serves it from its local cache. A scenario that cannot yield an enclosing JSX node is
 labeled `whole-file fallback` and correctly reports zero savings.
 
+### Safety benchmark
+
+`uv run e2e-healer safety-benchmark` is a separate, opt-in benchmark of repair _safety_: it runs
+labeled scenarios through the real repair graph and reports whether each was repaired or refused
+as it should be, per mutation class, with latency and repair attempts. It needs a model key and
+Playwright browsers, and a scheduled CI job publishes its report without ever blocking a merge.
+`--enforce-gates` applies the release gates (false-green 0%, refusal accuracy ≥ 95%, incorrect
+refusals ≤ 20%, once a rate covers 20+ scenarios) before a release. See the
+[safety benchmark reference](docs-site/docs/reference/safety-benchmark.mdx).
+
 ## Configuration
 
 All settings use the `E2E_HEALER_` prefix (see [`.env.example`](.env.example)). LLM
@@ -280,19 +311,38 @@ changes.
 
 ### Provider matrix
 
-| Provider    | Install                    | Required env                                          | Structured outputs            | Notes                                                             |
-| ----------- | -------------------------- | ----------------------------------------------------- | ----------------------------- | ----------------------------------------------------------------- |
-| `nvidia`    | built-in (default)         | `E2E_HEALER_LLM_API_KEY` (or legacy `NVIDIA_API_KEY`) | strict `json_schema`          | OpenAI-compatible NIM endpoint; default `openai/gpt-oss-120b`.    |
-| `openai`    | built-in                   | `E2E_HEALER_LLM_API_KEY` **or** `OPENAI_API_KEY`      | strict `json_schema` (native) | Set `LLM_BASE_URL` for Azure / OpenAI-compatible endpoints.       |
-| `anthropic` | `ai-driven-e2e[anthropic]` | `E2E_HEALER_LLM_API_KEY` **or** `ANTHROPIC_API_KEY`   | tool-use                      | No OpenAI `response_format`; schema enforced via Claude tool-use. |
-| `ollama`    | `ai-driven-e2e[ollama]`    | none (local)                                          | native JSON-schema `format`   | Fully offline; smaller models are less reliable at strict JSON.   |
-| `deepseek`  | built-in                   | `E2E_HEALER_LLM_API_KEY` **or** `DEEPSEEK_API_KEY`    | Responses API `json_schema`   | Stateless Responses API; default `deepseek-v4-flash`.             |
-| `orcarouter`| built-in                   | `E2E_HEALER_LLM_API_KEY` **or** `ORCAROUTER_API_KEY`  | LangChain default             | OpenAI-compatible endpoint; default base URL is `https://api.orcarouter.ai/v1`. |
+| Provider     | Install                    | Required env                                          | Structured outputs            | Notes                                                                           |
+| ------------ | -------------------------- | ----------------------------------------------------- | ----------------------------- | ------------------------------------------------------------------------------- |
+| `nvidia`     | built-in (default)         | `E2E_HEALER_LLM_API_KEY` (or legacy `NVIDIA_API_KEY`) | strict `json_schema`          | OpenAI-compatible NIM endpoint; default `openai/gpt-oss-120b`.                  |
+| `openai`     | built-in                   | `E2E_HEALER_LLM_API_KEY` **or** `OPENAI_API_KEY`      | strict `json_schema` (native) | Set `LLM_BASE_URL` for Azure / OpenAI-compatible endpoints.                     |
+| `anthropic`  | `ai-driven-e2e[anthropic]` | `E2E_HEALER_LLM_API_KEY` **or** `ANTHROPIC_API_KEY`   | tool-use                      | No OpenAI `response_format`; schema enforced via Claude tool-use.               |
+| `ollama`     | `ai-driven-e2e[ollama]`    | none (local)                                          | native JSON-schema `format`   | Fully offline; smaller models are less reliable at strict JSON.                 |
+| `deepseek`   | built-in                   | `E2E_HEALER_LLM_API_KEY` **or** `DEEPSEEK_API_KEY`    | Responses API `json_schema`   | Stateless Responses API; default `deepseek-v4-flash`.                           |
+| `orcarouter` | built-in                   | `E2E_HEALER_LLM_API_KEY` **or** `ORCAROUTER_API_KEY`  | LangChain default             | OpenAI-compatible endpoint; default base URL is `https://api.orcarouter.ai/v1`. |
 
 All providers read the generic `E2E_HEALER_LLM_MODEL` / `E2E_HEALER_LLM_MAX_TOKENS` /
 `E2E_HEALER_LLM_BASE_URL`. On a structured-output parse failure the engine retries
 (tenacity) and then falls back to the Patch Generator feedback loop, so a flaky JSON
 response never crashes the run.
+
+### Keeping evidence on your machine
+
+Where the evidence goes is configuration, never a code change. Any OpenAI-compatible server —
+Ollama, vLLM, llama.cpp, an internal gateway — can replace a hosted provider:
+
+```bash
+E2E_HEALER_LLM_PROVIDER=openai
+E2E_HEALER_LLM_BASE_URL=http://127.0.0.1:8000/v1   # or a private address on your LAN
+E2E_HEALER_LLM_MODEL=your-served-model
+E2E_HEALER_LLM_API_KEY=placeholder-key            # many local servers require a value but ignore it
+```
+
+Every `--json` result whose repair loop ran reports `evidence.provenance` (`provider`, `model`,
+redacted `endpoint`, `mode` = `local` or `remote`, and the redaction counters), so local versus
+remote is readable from the output rather than assumed. What is sent, what is redacted, and what
+deliberately is not are documented in
+[docs-site/docs/safety/data-boundary.mdx](docs-site/docs/safety/data-boundary.mdx); the full
+variable list is in [docs-site/docs/reference/configuration.mdx](docs-site/docs/reference/configuration.mdx).
 
 ### Using OpenAI
 
@@ -389,29 +439,31 @@ print(generate_diagnosis("You are a terse assistant.", "Say OK"))
 PY
 ```
 
-| Variable                       | Default                               | Purpose                                                |
-| ------------------------------ | ------------------------------------- | ------------------------------------------------------ |
+| Variable                       | Default                               | Purpose                                                                          |
+| ------------------------------ | ------------------------------------- | -------------------------------------------------------------------------------- |
 | `E2E_HEALER_LLM_PROVIDER`      | `nvidia`                              | LLM backend: `nvidia`, `openai`, `anthropic`, `ollama`, `deepseek`, `orcarouter` |
-| `E2E_HEALER_LLM_API_KEY`       | —                                     | API key for the selected provider                      |
-| `E2E_HEALER_LLM_BASE_URL`      | —                                     | OpenAI-compatible endpoint (empty = SDK default)       |
-| `E2E_HEALER_LLM_MODEL`         | —                                     | Structured-Outputs-capable model                       |
-| `E2E_HEALER_LLM_MAX_TOKENS`    | `4096`                                | Completion token cap (headroom for reasoning)          |
-| `E2E_HEALER_NVIDIA_API_KEY`    | —                                     | NVIDIA NIM API key (legacy; maps to `LLM_API_KEY`)     |
-| `E2E_HEALER_NVIDIA_BASE_URL`   | `https://integrate.api.nvidia.com/v1` | OpenAI-compatible endpoint (legacy)                    |
-| `E2E_HEALER_NVIDIA_MODEL`      | `openai/gpt-oss-120b`                 | Structured-Outputs-capable model (legacy)              |
-| `E2E_HEALER_NVIDIA_MAX_TOKENS` | `4096`                                | Completion token cap (legacy)                          |
-| `ORCAROUTER_API_KEY`            | —                                     | OrcaRouter API key (used when provider is `orcarouter`) |
-| `ORCAROUTER_BASE_URL`           | `https://api.orcarouter.ai/v1`        | OrcaRouter OpenAI-compatible endpoint                  |
-| `E2E_HEALER_MAX_LOOPS`         | `3`                                   | Repair loop cap                                        |
-| `E2E_HEALER_PLAYWRIGHT_CMD`    | `npx playwright test`                 | Playwright invocation                                  |
-| `E2E_HEALER_VERIFY_SELECTORS`  | `true`                                | Toggle live-DOM selector verification                  |
-| `E2E_HEALER_APP_URL`           | —                                     | URL the Selector Verifier loads (empty = skip)         |
-| `E2E_HEALER_NODE_CMD`          | `node`                                | Node executable for the verifier                       |
-| `E2E_HEALER_SANDBOX_MODE`      | `relaxed`                             | `strict`, `relaxed`, or `off`                          |
-| `E2E_HEALER_WORKSPACE_ROOT`    | `.`                                   | Root for strict path checks                            |
-| `E2E_HEALER_WRITE_GLOBS`       | `*.spec.js,...`                       | Writable test-file globs                               |
-| `E2E_HEALER_DENY_GLOBS`        | `.env,.git/**,...`                    | Paths blocked by the sandbox                           |
-| `E2E_HEALER_ALLOW_TEMP_HELPER` | `true`                                | Permit selector verifier helper file                   |
+| `E2E_HEALER_LLM_API_KEY`       | —                                     | API key for the selected provider                                                |
+| `E2E_HEALER_LLM_BASE_URL`      | —                                     | OpenAI-compatible endpoint (empty = SDK default)                                 |
+| `E2E_HEALER_LLM_MODEL`         | —                                     | Structured-Outputs-capable model                                                 |
+| `E2E_HEALER_LLM_MAX_TOKENS`    | `4096`                                | Completion token cap (headroom for reasoning)                                    |
+| `E2E_HEALER_SENSITIVE_ENV_VARS` | —                                   | Variable names whose values are redacted from prompts, JSON, and logs             |
+| `E2E_HEALER_SENSITIVE_VALUES`  | —                                   | Literal values to redact (min 4 chars, masked, comma-separated)                   |
+| `E2E_HEALER_NVIDIA_API_KEY`    | —                                     | NVIDIA NIM API key (legacy; maps to `LLM_API_KEY`)                               |
+| `E2E_HEALER_NVIDIA_BASE_URL`   | `https://integrate.api.nvidia.com/v1` | OpenAI-compatible endpoint (legacy)                                              |
+| `E2E_HEALER_NVIDIA_MODEL`      | `minimaxai/minimax-m3.1-flash`        | Structured-Outputs-capable model (legacy)                                        |
+| `E2E_HEALER_NVIDIA_MAX_TOKENS` | `4096`                                | Completion token cap (legacy)                                                    |
+| `ORCAROUTER_API_KEY`           | —                                     | OrcaRouter API key (used when provider is `orcarouter`)                          |
+| `ORCAROUTER_BASE_URL`          | `https://api.orcarouter.ai/v1`        | OrcaRouter OpenAI-compatible endpoint                                            |
+| `E2E_HEALER_MAX_LOOPS`         | `3`                                   | Repair loop cap                                                                  |
+| `E2E_HEALER_PLAYWRIGHT_CMD`    | `npx playwright test`                 | Playwright invocation                                                            |
+| `E2E_HEALER_VERIFY_SELECTORS`  | `true`                                | Toggle live-DOM selector verification                                            |
+| `E2E_HEALER_APP_URL`           | —                                     | URL the Selector Verifier loads (empty = skip)                                   |
+| `E2E_HEALER_NODE_CMD`          | `node`                                | Node executable for the verifier                                                 |
+| `E2E_HEALER_SANDBOX_MODE`      | `relaxed`                             | `strict`, `relaxed`, or `off`                                                    |
+| `E2E_HEALER_WORKSPACE_ROOT`    | `.`                                   | Root for strict path checks                                                      |
+| `E2E_HEALER_WRITE_GLOBS`       | `*.spec.js,...`                       | Writable test-file globs                                                         |
+| `E2E_HEALER_DENY_GLOBS`        | `.env,.git/**,...`                    | Paths blocked by the sandbox                                                     |
+| `E2E_HEALER_ALLOW_TEMP_HELPER` | `true`                                | Permit selector verifier helper file                                             |
 
 > The `--app-url` CLI flag overrides `E2E_HEALER_APP_URL`. To actually run selector
 > verification locally, the Playwright project needs browsers installed

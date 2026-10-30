@@ -36,6 +36,7 @@ const sidebars: SidebarsConfig = {
             label: "Safety & Guardrails",
             items: [
                 "safety/scope-guardrail",
+                "safety/data-boundary",
                 "safety/sandbox-modes",
                 "safety/human-in-the-loop",
             ],
@@ -58,7 +59,9 @@ const sidebars: SidebarsConfig = {
                 "reference/github-action",
                 "reference/configuration",
                 "reference/exit-codes",
+                "reference/json-output",
                 "reference/schema-versioning",
+                "reference/safety-benchmark",
             ],
         },
         {

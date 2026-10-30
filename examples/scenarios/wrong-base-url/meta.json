@@ -1,0 +1,1 @@
+{"class":"environment","expected_outcome":"refuse","failing_selector":"page.goto(\"/\")","rationale":"The Playwright baseURL points at a port nothing listens on, so navigation fails before any selector runs; the app and test are fine and no change to the test is a correct fix."}

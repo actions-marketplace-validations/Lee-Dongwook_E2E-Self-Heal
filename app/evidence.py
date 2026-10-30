@@ -4,12 +4,15 @@ import hashlib
 from pathlib import Path
 from typing import Literal, cast
 
+from app.config import settings
 from app.healing_history import extract_failing_selector
+from app.provenance import provider_provenance
 from app.sandbox import workspace_root
 from app.schemas import (
     CandidateEvidence,
     EvidenceBundle,
     EvidenceDomDiff,
+    GraphStep,
     LoopEvidence,
     LoopEvidenceDetails,
     PatchInstruction,
@@ -25,6 +28,7 @@ from app.state import (
     EvidenceLoopDetails,
     EvidenceLoopRecord,
 )
+from app.verify.ast_lock import AstLockVerdict
 
 EvidenceStage = Literal[
     "memory_lookup",
@@ -66,30 +70,34 @@ def add_candidate(
     memory_score: float | None = None,
     outcome: Literal["generated", "accepted", "rejected"] = "generated",
     rejection: str | None = None,
+    ast_lock: AstLockVerdict | None = None,
 ) -> list[EvidenceCandidateRecord]:
-    """Record a candidate in order so a later retry cannot discard it."""
+    """Record a candidate in order so a later retry cannot discard it.
+
+    ``ast_lock`` is the structural lock's verdict when it is what rejected the candidate.
+    """
     candidates = [
         cast(EvidenceCandidateRecord, dict(candidate))
         for candidate in state.get("evidence_candidates", [])
     ]
-    candidates.append(
-        cast(
-            EvidenceCandidateRecord,
-            redact_value(
-                {
-                    "loop_count": state["loop_count"],
-                    "source": source,
-                    "instructions": cast(
-                        list[EvidenceInstructionRecord],
-                        [instruction.model_dump() for instruction in instructions],
-                    ),
-                    "memory_score": memory_score,
-                    "outcome": outcome,
-                    "rejection": rejection,
-                }
-            ),
-        )
-    )
+    record: dict[str, object] = {
+        "loop_count": state["loop_count"],
+        "source": source,
+        "instructions": cast(
+            list[EvidenceInstructionRecord],
+            [instruction.model_dump() for instruction in instructions],
+        ),
+        "memory_score": memory_score,
+        "outcome": outcome,
+        "rejection": rejection,
+    }
+    if ast_lock is not None and not ast_lock.allowed:
+        record["ast_lock"] = {
+            "reason": ast_lock.reason,
+            "node_kind": ast_lock.node_kind,
+            "line": ast_lock.line,
+        }
+    candidates.append(cast(EvidenceCandidateRecord, redact_value(record)))
     return candidates
 
 
@@ -156,6 +164,10 @@ def build_evidence_bundle(state: AgentState, *, initial_error_log: str) -> Evide
         LoopEvidence.model_validate(redact_value(event))
         for event in state.get("evidence_history", [])
     ]
+    for candidate in candidates:
+        # A decision with no later node is where the run stopped.
+        if candidate.outcome != "generated" and candidate.next_step is None:
+            candidate.next_step = "end"
     return EvidenceBundle(
         parsed_error=parsed_error,
         failing_selector=extract_failing_selector(parsed_error),
@@ -165,6 +177,9 @@ def build_evidence_bundle(state: AgentState, *, initial_error_log: str) -> Evide
         ),
         candidates=candidates,
         loop_history=loop_history,
+        provenance=provider_provenance(state),
+        path=[GraphStep.model_validate(step) for step in state.get("graph_path", [])],
+        loop_budget=settings.max_loops,
     )
 
 

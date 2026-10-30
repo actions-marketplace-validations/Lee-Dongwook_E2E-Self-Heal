@@ -8,7 +8,9 @@ from typing import cast
 import structlog
 
 from app.evidence import add_candidate, add_loop_event
+from app.evidence_boundary import prepare_evidence, redaction_state_update
 from app.llm import generate_patch
+from app.prompts.diagnoser import untouched_selector_fact
 from app.prompts.patch_generator import (
     DomDiffEntry,
     build_system_prompt,
@@ -18,6 +20,8 @@ from app.sandbox import SandboxViolation, assert_patch_boundary_allowed
 from app.schemas import PatchInstruction
 from app.state import AgentState
 from app.utils.files import split_line_ending
+from app.utils.js_line import restyle_like, same_line_ignoring_format
+from app.verify.ast_lock import AstLockVerdict, check_ast_lock
 
 logger = structlog.get_logger(__name__)
 _ALLOWED_PATCH_CALL = re.compile(
@@ -41,6 +45,9 @@ _SELECTOR_CALL = re.compile(
     r"(?:\bpage\.|\.)(locator|getByRole|getByText|getByLabel|getByPlaceholder|"
     r"getByAltText|getByTitle|getByTestId)\s*\("
 )
+# A trailing ``{ timeout: <number> }`` argument is a wait condition, not action data, so an
+# action may gain, lose, or retune one. The AST lock re-checks the same rule structurally.
+_TIMEOUT_ONLY_OPTION = re.compile(r"(?:,\s*)?\{\s*timeout\s*:\s*\d[\d_]*\s*\}\s*(?=\))")
 
 
 class _MaskState(Enum):
@@ -368,11 +375,29 @@ def _masked_selector_line(text: str) -> str | None:
     return masked
 
 
-def _validate_action_calls(instruction: PatchInstruction) -> None:
-    """Allow selector edits while preserving every other argument (data and options)."""
-    original = _masked_selector_line(instruction.original)
-    replacement = _masked_selector_line(instruction.replacement)
-    if original is None or replacement is None or original != replacement:
+def _validate_action_calls(
+    instruction: PatchInstruction,
+    *,
+    original_source: str | None = None,
+    replacement_source: str | None = None,
+) -> None:
+    """Allow selector edits while preserving every other argument (data and options).
+
+    A complete source view is required for action calls whose arguments continue onto
+    another line.  The line-only fallback remains useful for callers that validate an
+    instruction before they have the file contents.
+    """
+    original_text = original_source if original_source is not None else instruction.original
+    replacement_text = (
+        replacement_source if replacement_source is not None else instruction.replacement
+    )
+    original = _masked_selector_line(original_text)
+    replacement = _masked_selector_line(replacement_text)
+    if (
+        original is None
+        or replacement is None
+        or _TIMEOUT_ONLY_OPTION.sub("", original) != _TIMEOUT_ONLY_OPTION.sub("", replacement)
+    ):
         raise PatchGuardrailViolation(
             f"line {instruction.line} changes an argument other than the selector "
             "of a Playwright action"
@@ -384,18 +409,38 @@ class PatchApplicationError(ValueError):
 
 
 class PatchGuardrailViolation(PatchApplicationError):
-    """Raised when a candidate attempts to leave the selector/wait-condition boundary."""
+    """Raised when a candidate attempts to leave the selector/wait-condition boundary.
+
+    ``ast_lock`` carries the structural lock's verdict when that check produced the
+    rejection, so callers can record what was rejected as structured evidence instead of
+    re-parsing the message. It is ``None`` for the per-line scope gates.
+    """
+
+    def __init__(self, message: str, *, ast_lock: AstLockVerdict | None = None) -> None:
+        super().__init__(message)
+        self.ast_lock = ast_lock
+
+
+def ast_lock_verdict(error: BaseException) -> AstLockVerdict | None:
+    """Return the AST lock verdict behind a rejection, or ``None`` if another check raised it."""
+    return error.ast_lock if isinstance(error, PatchGuardrailViolation) else None
 
 
 def _validate_patch_scope(
-    instruction: PatchInstruction, masked_original: str | None = None
+    instruction: PatchInstruction,
+    masked_original: str | None = None,
+    *,
+    action_original: str | None = None,
+    action_replacement: str | None = None,
 ) -> None:
     """Reject edits outside the single-line locator/wait guardrail.
 
     ``masked_original`` is the code-only view of the target line computed against the
     *complete* source (see ``_apply``), so a line that continues a block comment or
     template literal opened on an earlier line is treated as non-code. When omitted,
-    the line is masked in isolation (tests / callers without file context).
+    the line is masked in isolation (tests / callers without file context). Action
+    validation additionally receives complete source views from ``_apply`` so a
+    multi-line action's arguments can be compared safely.
     """
     if "\n" in instruction.replacement or "\r" in instruction.replacement:
         raise PatchApplicationError(
@@ -416,11 +461,47 @@ def _validate_patch_scope(
             f"line {instruction.line} is not limited to a locator or wait condition"
         )
     if _ACTION_CALL.search(original_code) or _ACTION_CALL.search(replacement_code):
-        _validate_action_calls(instruction)
+        _validate_action_calls(
+            instruction,
+            original_source=action_original,
+            replacement_source=action_replacement,
+        )
+
+
+def _enforce_ast_lock(original: str, patched: str) -> None:
+    """Reject a patch whose AST differs outside locator strings, timeouts, and wait methods.
+
+    Fail-closed: a parse failure or any structural change is a guardrail violation. It is
+    raised as :class:`PatchGuardrailViolation`, a :class:`PatchApplicationError`, so each
+    caller handles it through its existing rejection path. The Patch Generator feeds it back
+    and spends a loop, so a generated candidate that keeps violating the lock can never retry
+    past ``settings.max_loops``. The memory lookup treats it as a cache miss (no loop spent);
+    that is bounded because the lookup runs once, before the generator loop starts.
+    """
+    if patched == original:
+        return  # Nothing changed, so there is nothing to verify.
+    verdict = check_ast_lock(original, patched)
+    if not verdict.allowed:
+        logger.warning(
+            "ast_lock_rejected",
+            reason=verdict.reason,
+            node_kind=verdict.node_kind,
+            line=verdict.line,
+        )
+        raise PatchGuardrailViolation(
+            f"AST lock rejected the patch ({verdict.reason}: {verdict.node_kind} at line "
+            f"{verdict.line}); only locator strings, timeouts, and wait methods may change",
+            ast_lock=verdict,
+        )
+    logger.info("ast_lock_passed", reason=verdict.reason)
 
 
 def _apply(code: str, instructions: list[PatchInstruction]) -> str:
-    """Validate and atomically apply line-targeted replacements to ``code``."""
+    """Validate and atomically apply line-targeted replacements to ``code``.
+
+    Shared by the Patch Generator and the memory lookup, so every candidate, however it
+    was produced, passes the regex scope gates and then the structural AST lock.
+    """
     lines = code.splitlines(keepends=True)
     # Mask the complete source once so a targeted line that continues a block comment or
     # template literal opened on an earlier line cannot satisfy the scope gates.
@@ -447,16 +528,51 @@ def _apply(code: str, instructions: list[PatchInstruction]) -> str:
 
         current, line_ending = split_line_ending(lines[index])
         if current != instruction.original:
-            raise PatchApplicationError(
-                f"line {instruction.line} no longer matches the expected original text"
+            if not same_line_ignoring_format(current, instruction.original):
+                found = [
+                    n
+                    for n, line in enumerate(lines, 1)
+                    if split_line_ending(line)[0] == instruction.original
+                    or same_line_ignoring_format(split_line_ending(line)[0], instruction.original)
+                ]
+                hint = f" (that text is on line {', '.join(map(str, found))})" if found else ""
+                raise PatchApplicationError(
+                    f"line {instruction.line} no longer matches the expected original text{hint}"
+                )
+            # The model re-typed the line (quotes, indentation, spacing) instead of copying it
+            # (#404). Write its replacement in the file's formatting, and judge that line: the
+            # scope gates and the AST lock below see exactly what reaches the disk.
+            instruction = instruction.model_copy(
+                update={
+                    "original": current,
+                    "replacement": restyle_like(
+                        current, instruction.original, instruction.replacement
+                    ),
+                }
             )
+            logger.info("patch_original_reformatted", line=instruction.line)
         masked_current, _ = split_line_ending(masked_lines[index])
-        _validate_patch_scope(instruction, masked_original=masked_current)
+        candidate_lines = lines.copy()
+        candidate_lines[index] = instruction.replacement + line_ending
+        candidate = "".join(candidate_lines)
+        _validate_patch_scope(
+            instruction,
+            masked_original=masked_current,
+            action_original=code,
+            action_replacement=candidate,
+        )
         replacements.append((index, instruction.replacement + line_ending))
 
     for index, replacement in replacements:
         lines[index] = replacement
-    return "".join(lines)
+    patched = "".join(lines)
+    _enforce_ast_lock(code, patched)
+    return patched
+
+
+def _numbered(code: str) -> str:
+    """Prefix each line with its 1-based number so the model need not count lines."""
+    return "\n".join(f"{n}| {line}" for n, line in enumerate(code.splitlines(), 1))
 
 
 def patch_generator(state: AgentState) -> dict:
@@ -484,9 +600,21 @@ def patch_generator(state: AgentState) -> dict:
                 state, "patch_generator", "boundary_denied", error=str(exc)
             ),
         }
+    # The diagnosis can quote the raw log, so it crosses the evidence boundary; the numbered
+    # test source does not, because every instruction must match it byte for byte.
+    prepared = prepare_evidence(state)
+    # The diff check is restated here rather than left to the diagnosis to relay: it is a
+    # deterministic fact, and the model must not trade it for a selector it likes better.
+    diff_check = (
+        f"{untouched_selector_fact(prepared.untouched_selector)}\n\n"
+        if prepared.untouched_selector
+        else ""
+    )
     user_prompt = (
-        f"Failure diagnosis:\n{state['analysis_report']}\n\n"
-        f"Current test code:\n{state['current_code']}"
+        f"Failure diagnosis:\n{prepared.analysis_report}\n\n"
+        f"{diff_check}"
+        f"Current test code (each line is prefixed with its 1-based number and '| ', which "
+        f"is not part of the line):\n{_numbered(state['current_code'])}"
     )
     framework = state.get("detected_framework") or detect_framework(
         state["test_script_path"],
@@ -506,6 +634,7 @@ def patch_generator(state: AgentState) -> dict:
             "verification_report": {},
             "memory_report": {"active": False, "source": "llm"},
             "evidence_history": add_loop_event(state, "patch_generator", "provider_failed"),
+            **redaction_state_update(state, prepared),
         }
 
     try:
@@ -536,10 +665,12 @@ def patch_generator(state: AgentState) -> dict:
                 instructions=output.instructions,
                 outcome="rejected",
                 rejection=str(exc),
+                ast_lock=ast_lock_verdict(exc),
             ),
             "evidence_history": add_loop_event(
                 state, "patch_generator", "application_rejected", error=str(exc)
             ),
+            **redaction_state_update(state, prepared),
         }
     logger.info("patch_generator_finished", instruction_count=len(output.instructions))
     return {
@@ -557,4 +688,5 @@ def patch_generator(state: AgentState) -> dict:
             "candidate_generated",
             instruction_count=len(output.instructions),
         ),
+        **redaction_state_update(state, prepared),
     }

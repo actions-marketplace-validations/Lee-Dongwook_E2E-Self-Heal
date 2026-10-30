@@ -1,0 +1,295 @@
+{
+  "schema_version": "2.3",
+  "kind": "refusal",
+  "test_script_path": "scenarios/account-email-regression/spec.ts",
+  "reason": "guardrail_violation",
+  "is_success": false,
+  "loop_count": 3,
+  "evidence": {
+    "parsed_error": "call log: locator('#save-email')",
+    "failing_selector": "#save-email",
+    "dom_diff_context": [
+      {
+        "file": "examples/demo-app/src/components/account/AccountEmail.tsx",
+        "line": 16,
+        "previous": {
+          "tag": "button",
+          "attributes": {
+            "id": "save-email",
+            "type": "button",
+            "onClick": "() => setStatus(`Saved ${email}`)"
+          }
+        },
+        "current": {
+          "tag": "button",
+          "attributes": {
+            "id": "update-email",
+            "type": "button",
+            "onClick": "() => setStatus(`Saved ${email}`)"
+          }
+        }
+      }
+    ],
+    "aria_snapshot": {
+      "sha256": "0c8fcf3cbb2e658353d68757ffc8de431da5b7b7f37b6517b8dd0d32c1af53f7",
+      "source_path": "test-results/account-email-regression-spec.ts-saves-the-email-address/error-context.md",
+      "chars": 1215
+    },
+    "candidates": [
+      {
+        "loop_count": 0,
+        "source": "llm",
+        "instructions": [
+          {
+            "line": 6,
+            "original": "  await page.click(\"#save-email\");",
+            "replacement": "  await page.click(\"#update-email\");",
+            "reason": "The button's id attribute was changed from 'save-email' to 'update-email' in the DOM; updating the selector to match the new id.",
+            "selector": "#update-email"
+          }
+        ],
+        "memory_score": null,
+        "shadow_score": null,
+        "selector_counts": {},
+        "test_passed": false,
+        "outcome": "rejected",
+        "rejection": "test_failed",
+        "ast_lock": null,
+        "next_step": "diagnoser"
+      },
+      {
+        "loop_count": 1,
+        "source": "llm",
+        "instructions": [
+          {
+            "line": 5,
+            "original": "  await page.fill(\"#email-input\", \"grace@example.com\");",
+            "replacement": "  await page.fill(\"role=textbox[name='Email address']\", \"grace@example.com\");",
+            "reason": "The id='email-input' no longer exists in the DOM. The ARIA snapshot shows the textbox is labelled 'Email address', so using the ARIA role+name locator targets it reliably.",
+            "selector": "role=textbox[name='Email address']"
+          }
+        ],
+        "memory_score": null,
+        "shadow_score": null,
+        "selector_counts": {},
+        "test_passed": false,
+        "outcome": "rejected",
+        "rejection": "test_failed",
+        "ast_lock": null,
+        "next_step": "diagnoser"
+      },
+      {
+        "loop_count": 2,
+        "source": "llm",
+        "instructions": [
+          {
+            "line": 5,
+            "original": "  await page.fill(\"role=textbox[name='Email address']\", \"grace@example.com\");",
+            "replacement": "  await page.locator(\"role=textbox[name='Email address']\").triple_click(); await page.locator(\"role=textbox[name='Email address']\").type(\"grace@example.com\");",
+            "reason": "page.fill() bypasses React's synthetic onChange handler so the controlled state never updates. Using triple_click() to select all + type() dispatches real keyboard events that trigger React's onChange, ensuring the component state is updated to 'grace@example.com' before the button click.",
+            "selector": "role=textbox[name='Email address']"
+          }
+        ],
+        "memory_score": null,
+        "shadow_score": null,
+        "selector_counts": {},
+        "test_passed": null,
+        "outcome": "rejected",
+        "rejection": "line 5 changes an argument other than the selector of a Playwright action",
+        "ast_lock": null,
+        "next_step": "refusal_finalizer"
+      }
+    ],
+    "loop_history": [
+      {
+        "loop_count": 0,
+        "stage": "memory_lookup",
+        "outcome": "disabled",
+        "details": {
+          "score": null,
+          "error": null,
+          "instruction_count": null,
+          "reason": null
+        }
+      },
+      {
+        "loop_count": 0,
+        "stage": "patch_generator",
+        "outcome": "candidate_generated",
+        "details": {
+          "score": null,
+          "error": null,
+          "instruction_count": 1,
+          "reason": null
+        }
+      },
+      {
+        "loop_count": 0,
+        "stage": "shadow_verifier",
+        "outcome": "skipped",
+        "details": {
+          "score": null,
+          "error": null,
+          "instruction_count": null,
+          "reason": null
+        }
+      },
+      {
+        "loop_count": 0,
+        "stage": "selector_verifier",
+        "outcome": "skipped",
+        "details": {
+          "score": null,
+          "error": null,
+          "instruction_count": null,
+          "reason": null
+        }
+      },
+      {
+        "loop_count": 0,
+        "stage": "test_runner",
+        "outcome": "failed",
+        "details": {
+          "score": null,
+          "error": null,
+          "instruction_count": null,
+          "reason": null
+        }
+      },
+      {
+        "loop_count": 1,
+        "stage": "patch_generator",
+        "outcome": "candidate_generated",
+        "details": {
+          "score": null,
+          "error": null,
+          "instruction_count": 1,
+          "reason": null
+        }
+      },
+      {
+        "loop_count": 1,
+        "stage": "shadow_verifier",
+        "outcome": "skipped",
+        "details": {
+          "score": null,
+          "error": null,
+          "instruction_count": null,
+          "reason": null
+        }
+      },
+      {
+        "loop_count": 1,
+        "stage": "selector_verifier",
+        "outcome": "skipped",
+        "details": {
+          "score": null,
+          "error": null,
+          "instruction_count": null,
+          "reason": null
+        }
+      },
+      {
+        "loop_count": 1,
+        "stage": "test_runner",
+        "outcome": "failed",
+        "details": {
+          "score": null,
+          "error": null,
+          "instruction_count": null,
+          "reason": null
+        }
+      },
+      {
+        "loop_count": 2,
+        "stage": "patch_generator",
+        "outcome": "application_rejected",
+        "details": {
+          "score": null,
+          "error": "line 5 changes an argument other than the selector of a Playwright action",
+          "instruction_count": null,
+          "reason": null
+        }
+      },
+      {
+        "loop_count": 3,
+        "stage": "refusal_finalizer",
+        "outcome": "refused",
+        "details": {
+          "score": null,
+          "error": null,
+          "instruction_count": null,
+          "reason": "guardrail_violation"
+        }
+      }
+    ],
+    "provenance": {
+      "provider": "anthropic",
+      "model": "claude-sonnet-4-6",
+      "endpoint": "https://api.anthropic.com",
+      "mode": "remote",
+      "redaction_applied": false,
+      "redaction_count": 0
+    },
+    "path": [
+      {
+        "node": "memory_lookup",
+        "loop_count": 0
+      },
+      {
+        "node": "diagnoser",
+        "loop_count": 0
+      },
+      {
+        "node": "patch_generator",
+        "loop_count": 0
+      },
+      {
+        "node": "shadow_verifier",
+        "loop_count": 0
+      },
+      {
+        "node": "selector_verifier",
+        "loop_count": 0
+      },
+      {
+        "node": "test_runner",
+        "loop_count": 1
+      },
+      {
+        "node": "diagnoser",
+        "loop_count": 1
+      },
+      {
+        "node": "patch_generator",
+        "loop_count": 1
+      },
+      {
+        "node": "shadow_verifier",
+        "loop_count": 1
+      },
+      {
+        "node": "selector_verifier",
+        "loop_count": 1
+      },
+      {
+        "node": "test_runner",
+        "loop_count": 2
+      },
+      {
+        "node": "diagnoser",
+        "loop_count": 2
+      },
+      {
+        "node": "patch_generator",
+        "loop_count": 3
+      },
+      {
+        "node": "refusal_finalizer",
+        "loop_count": 3
+      }
+    ],
+    "loop_budget": 3
+  },
+  "termination": "refused"
+}

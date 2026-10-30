@@ -1,26 +1,14 @@
 from unittest.mock import patch
 
-from app.nodes.diagnoser import _DIAGNOSIS_UNAVAILABLE, diagnoser
+from app.nodes.diagnoser import DIAGNOSIS_UNAVAILABLE, diagnoser
 from app.preprocess.aria_snapshot import abstract_snapshot
 from app.state import AgentState
+from tests.factories import make_state
 
 
-def _state(**overrides) -> AgentState:
-    base: AgentState = {
-        "test_script_path": "t.spec.ts",
-        "original_code": "",
-        "current_code": 'await page.click("#old")',
-        "error_log": "Error: timeout",
-        "dom_diff_context": [],
-        "dom_snapshot": "",
-        "analysis_report": "",
-        "patch_instructions": {},
-        "verification_report": {},
-        "loop_count": 0,
-        "is_success": False,
-    }
-    base.update(overrides)  # type: ignore[typeddict-item]
-    return base
+def _state(**overrides: object) -> AgentState:
+    defaults = {"current_code": 'await page.click("#old")', "error_log": "Error: timeout"}
+    return make_state(**(defaults | overrides))
 
 
 def test_abstract_snapshot_truncates_long_input():
@@ -65,4 +53,8 @@ def test_diagnoser_degrades_on_provider_error():
     with patch("app.nodes.diagnoser.generate_diagnosis", side_effect=boom):
         result = diagnoser(_state())
 
-    assert result == {"analysis_report": _DIAGNOSIS_UNAVAILABLE}
+    assert result["analysis_report"] == DIAGNOSIS_UNAVAILABLE
+    # The evidence was prepared for the provider call even though it failed, so the counters
+    # are still reported rather than dropped.
+    assert result["redaction_count"] == 0
+    assert result["redaction_applied"] is False

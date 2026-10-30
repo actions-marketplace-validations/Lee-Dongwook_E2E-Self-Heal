@@ -3,12 +3,27 @@
 from enum import Enum
 from typing import Annotated, Literal, TypedDict, cast
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 # Version of the machine-readable CI contract emitted as `--json`. Version 2 adds the
 # ``refusal`` discriminator and closed refusal reasons, which the published compatibility
-# policy classifies as a breaking change.
-SCHEMA_VERSION: Literal["2.0"] = "2.0"
+# policy classifies as a breaking change. Version 2.1 adds the optional
+# ``CandidateEvidence.ast_lock`` detail object, a compatible minor addition. Version 2.2 adds
+# the optional ``EvidenceBundle.provenance`` object, another compatible minor addition. Version
+# 2.3 adds the executed graph ``path``, the ``loop_budget``, ``CandidateEvidence.next_step`` and
+# the ``termination`` of a repair or refusal: optional additions, so a minor bump as well.
+SCHEMA_VERSION: Literal["2.3"] = "2.3"
+
+# How a repair run ended. ``refused`` covers every refusal reason except the loop cap, which
+# splits by what the last candidate ran into: a verifier (``verification_failed``) or nothing a
+# verifier could judge (``budget_exhausted``).
+Termination = Literal["verified", "refused", "budget_exhausted", "verification_failed"]
+
+# Candidate rejections that come from running a verifier on the patched test, as opposed to the
+# line gates, the AST lock or an application error that stop a candidate before verification.
+VERIFIER_REJECTIONS = frozenset(
+    {"shadow_failed", "shadow_error", "selector_not_unique", "test_failed", "final_suite_failed"}
+)
 
 
 class DomDiff(BaseModel):
@@ -65,6 +80,31 @@ class PatchOutput(BaseModel):
     instructions: list[PatchInstruction]
 
 
+class DiagnosisVerdict(str, Enum):
+    """What broke the test, as a closed set the decline adjudicator must choose from.
+
+    Only ``BEHAVIOUR_CHANGE`` changes the outcome: it is what turns a refusal into
+    ``RefusalReason.LIKELY_PRODUCT_REGRESSION``. The other two keep the ordinary repair loop,
+    so a wrong verdict of that kind costs a model call, never a wrong label.
+    """
+
+    SELECTOR_DRIFT = "selector_drift"
+    BEHAVIOUR_CHANGE = "behaviour_change"
+    UNCLEAR = "unclear"
+
+
+class DiagnosisVerdictOutput(BaseModel):
+    """Structured Output schema for the adjudication of a declined patch.
+
+    Internal to the repair loop: it is never emitted in the ``--json`` contract, so adding or
+    changing it is not a schema version change. ``rationale`` is required so the model has to
+    commit to a reason before naming a verdict; it is not otherwise consumed.
+    """
+
+    verdict: DiagnosisVerdict
+    rationale: str = Field(min_length=1, description="why this verdict fits the evidence")
+
+
 class RefusalReason(str, Enum):
     """Closed taxonomy for why the repair workflow declined to make a change."""
 
@@ -81,12 +121,31 @@ class SnapshotReference(BaseModel):
     """Stable reference to a redacted failure-time ARIA snapshot."""
 
     sha256: str = Field(description="SHA-256 digest of the redacted extracted snapshot content")
-    sha256: str = Field(description="SHA-256 digest of the redacted snapshot content")
     source_path: str | None = Field(
         default=None,
         description="workspace-relative error-context.md provenance path, when available",
     )
     chars: int = Field(ge=0, description="character count of the redacted snapshot")
+
+
+class AstLockRejection(BaseModel):
+    """What the structural AST lock rejected in a refused candidate.
+
+    ``reason`` is an open string, not a closed enum: the lock may report new reasons without
+    a schema major bump, so consumers must tolerate values they do not recognize. Current
+    values are ``disallowed_ast_change``, ``original_parse_error`` and ``patched_parse_error``.
+    """
+
+    reason: str = Field(description="why the lock rejected the candidate")
+    node_kind: str | None = Field(
+        default=None,
+        description="tree-sitter node type of the first offending node, when one is known",
+    )
+    line: int | None = Field(
+        default=None,
+        ge=1,
+        description="1-based line of the offending node in the patched (or unparsable) source",
+    )
 
 
 class CandidateEvidence(BaseModel):
@@ -101,6 +160,21 @@ class CandidateEvidence(BaseModel):
     test_passed: bool | None = None
     outcome: Literal["generated", "accepted", "rejected"] = "generated"
     rejection: str | None = None
+    ast_lock: AstLockRejection | None = Field(
+        default=None,
+        description=(
+            "structured AST lock verdict when the lock rejected this candidate; absent for "
+            "rejections from other checks, whose cause is only in ``rejection``"
+        ),
+    )
+    next_step: str | None = Field(
+        default=None,
+        description=(
+            "graph node the run moved to once this candidate was accepted or rejected, or "
+            "``end`` when the run stopped there; null while it was still undecided. An open "
+            "string: nodes can be added without a contract change"
+        ),
+    )
 
 
 class LoopEvidenceDetails(BaseModel):
@@ -128,6 +202,13 @@ class LoopEvidence(BaseModel):
     details: LoopEvidenceDetails = Field(default_factory=LoopEvidenceDetails)
 
 
+class GraphStep(BaseModel):
+    """One node the repair graph executed, in execution order."""
+
+    node: str = Field(description="graph node name; an open string, nodes can be added")
+    loop_count: int = Field(ge=0, description="loop count after the node ran")
+
+
 class SelectorHintEvidence(BaseModel):
     """A user-provided selector hint preserved in repair evidence."""
 
@@ -139,6 +220,32 @@ class SelectorHintEvidence(BaseModel):
     priority: Literal["high"]
 
 
+class ProviderProvenance(BaseModel):
+    """Where the repair evidence was sent, and whether it was redacted first.
+
+    Deliberately non-sensitive: no prompt text, no response text, no credential. ``provider``
+    is an open string rather than a closed enum so adding a backend is not a contract change;
+    consumers must tolerate values they do not recognize. ``endpoint`` is the endpoint the
+    client actually used, with URL credentials and sensitive query values removed.
+    """
+
+    provider: str = Field(description="configured provider backend (an open, growing set)")
+    model: str = Field(description="model name the provider was asked to run")
+    endpoint: str = Field(description="redacted endpoint evidence was sent to")
+    mode: Literal["local", "remote"] = Field(
+        description=(
+            "local when the endpoint host is loopback or a private/link-local address, "
+            "otherwise remote; derived from the address, never from DNS"
+        )
+    )
+    redaction_applied: bool = Field(
+        description="whether the evidence boundary replaced at least one value in a prompt"
+    )
+    redaction_count: int = Field(
+        ge=0, description="number of values the evidence boundary replaced while prompting"
+    )
+
+
 class EvidenceBundle(BaseModel):
     """Reviewable, redacted evidence used to decide a repair or refusal."""
 
@@ -148,12 +255,31 @@ class EvidenceBundle(BaseModel):
     aria_snapshot: SnapshotReference | None = None
     candidates: list[CandidateEvidence] = Field(default_factory=list)
     loop_history: list[LoopEvidence] = Field(default_factory=list)
+    provenance: ProviderProvenance | None = Field(
+        default=None,
+        description=(
+            "provider, model, and endpoint that saw the evidence; absent when the graph never "
+            "ran, because then nothing was sent to a provider"
+        ),
+    )
+    path: list[GraphStep] = Field(
+        default_factory=list,
+        description=(
+            "every node the repair graph executed, in order; each adjacent pair is a routing "
+            "decision. Empty when the graph never ran"
+        ),
+    )
+    loop_budget: int | None = Field(
+        default=None,
+        ge=1,
+        description="loop cap the run was allowed (E2E_HEALER_MAX_LOOPS); null when it never ran",
+    )
 
 
 class RefusalReport(BaseModel):
     """Machine-readable outcome when the repair workflow refuses to change a test."""
 
-    schema_version: Literal["2.0"] = Field(
+    schema_version: Literal["2.3"] = Field(
         default=SCHEMA_VERSION,
         description="version of this machine-readable contract; bump on breaking changes",
     )
@@ -176,11 +302,22 @@ class RefusalReport(BaseModel):
     loop_count: int = Field(ge=0, description="repair-loop count when the refusal was finalized")
     evidence: EvidenceBundle
 
+    @computed_field
+    @property
+    def termination(self) -> Termination:
+        """How the run ended: a refusal on evidence, or the loop cap with what stopped it."""
+        if self.reason is not RefusalReason.LOOP_CAP_REACHED:
+            return "refused"
+        candidates = self.evidence.candidates
+        if candidates and candidates[-1].rejection in VERIFIER_REJECTIONS:
+            return "verification_failed"
+        return "budget_exhausted"
+
 
 class RepairSummary(BaseModel):
     """Machine-readable result emitted for the CI wrapper to consume."""
 
-    schema_version: Literal["2.0"] = Field(
+    schema_version: Literal["2.3"] = Field(
         default=SCHEMA_VERSION,
         description="version of this machine-readable contract; bump on breaking changes",
     )
@@ -194,6 +331,12 @@ class RepairSummary(BaseModel):
     instructions: list[PatchInstruction] = Field(default_factory=list)
     evidence: EvidenceBundle = Field(default_factory=EvidenceBundle)
 
+    @computed_field
+    @property
+    def termination(self) -> Termination:
+        """``verified``, or ``verification_failed`` once the final suite rerun rejected it."""
+        return "verified" if self.is_success else "verification_failed"
+
 
 HealResult = Annotated[RepairSummary | RefusalReport, Field(discriminator="kind")]
 
@@ -201,7 +344,7 @@ HealResult = Annotated[RepairSummary | RefusalReport, Field(discriminator="kind"
 class SuiteSummary(BaseModel):
     """Aggregate result when healing a whole suite (multiple failing tests)."""
 
-    schema_version: Literal["2.0"] = Field(
+    schema_version: Literal["2.3"] = Field(
         default=SCHEMA_VERSION,
         description="version of this machine-readable contract; bump on breaking changes",
     )
@@ -248,7 +391,7 @@ class ReviewOutput(BaseModel):
 class ReviewReport(BaseModel):
     """Machine-readable review result emitted for the CI wrapper to post as PR comments."""
 
-    schema_version: Literal["2.0"] = Field(
+    schema_version: Literal["2.3"] = Field(
         default=SCHEMA_VERSION,
         description="version of this machine-readable contract; bump on breaking changes",
     )

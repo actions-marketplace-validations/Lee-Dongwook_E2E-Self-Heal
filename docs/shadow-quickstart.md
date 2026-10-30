@@ -50,7 +50,7 @@ print(f"saved {len(network_snapshots)} network interactions as '{snapshot_id}'")
 PY
 ```
 
-The snapshot lands as JSON under `.shadow_workspace/snapshots/login-happy-path.json`
+The snapshot lands as JSON under `.shadow_workspace/snapshots/<sha256 of the snapshot id>.json`
 (the workspace root and subdirectory names come from
 [`ShadowConfig`](../app/shadow/config.py)). Deterministic, diff-friendly serialization
 means re-running this against the same trace always produces the same file.
@@ -64,6 +64,13 @@ be moved aside or emptied before it can be claimed.
 Snapshots are durable: `ON_SUCCESS` and `ALWAYS` cleanup remove only the workspace's
 `cache/` and `tmp/` directories. The owned root and `snapshots/` remain available for
 later replays. `NEVER` preserves all three artifact directories.
+
+### Offline replay policy
+
+Set `offline=True` to make replay a hard no-network boundary. Offline runs require
+`miss_policy="strict"`: an unmatched request is aborted and is never continued to the
+live origin or fetched for recording. `lenient` and `record-and-augment` are rejected
+when combined with offline mode; use them only when deliberately allowing live traffic.
 
 ## 3. Replay the test with `e2e-healer --shadow`
 

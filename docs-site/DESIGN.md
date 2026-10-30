@@ -131,7 +131,16 @@ down-arrow. Hovering a box reveals a one-line tooltip (text via props).
 - Mobile: same vertical flow, full-width boxes.
 - Props-driven: stage labels and tooltips come from props — no hardcoded copy.
 - Implementation freedom: hand-rolled CSS/SVG **or** the Mermaid plugin — your call,
-  as long as tokens and order are respected.
+  as long as tokens and order are respected. The component ships both: `variant="dom"`
+  (default) and `variant="mermaid"`, drawing the same stages in the same order.
+- Keyboard: a stage with a tooltip is focusable, and its tooltip shows on hover and on
+  `:focus-visible`. On devices that cannot hover (touch screens) the styled tooltip is hidden
+  except on keyboard focus, regardless of window width. The native `title` stays as a
+  fallback, and the tooltip is linked with `aria-describedby`.
+- Mermaid variant: tokens are applied to the rendered SVG from the component's CSS Module
+  (Mermaid's definition syntax cannot express `var(--token)`), and the resolved
+  `--eeh-font-mono` stack is passed to Mermaid so boxes are sized for the font drawn. SVG has
+  no hover tooltip, so tooltip text is carried in the diagram's accessible description.
 
 ### 3.3 `<HealingDiff/>` — Issue B2
 
@@ -178,7 +187,7 @@ from `src/data/help-wanted.json` (`{title, description, issueUrl, area, difficul
 - Filter toggles by `area`. Whole card links to `issueUrl`.
 - Grid: 3 cols desktop → 2 tablet → 1 mobile.
 
-### 3.5 Architecture doc page (`docs/architecture/overview.md`) — Issue C2
+### 3.5 Architecture doc page (`docs/architecture/repair-loop.mdx`) — Issue C2
 
 Standard Docusaurus MDX doc: sidebar entry under an "Architecture" category, anchored
 headings, and `<ArchitectureFlow/>` embedded inline. Content Markdown provided by

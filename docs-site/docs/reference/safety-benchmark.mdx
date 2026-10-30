@@ -1,0 +1,374 @@
+---
+title: "Safety benchmark"
+description: "Measure whether repairs were safe, not just whether they were produced: labeled scenarios, per-class results, and a non-blocking CI report."
+---
+
+# Safety benchmark
+
+`e2e-healer safety-benchmark` runs labeled scenarios through the real repair graph and reports
+whether each one ended the way it should. Some scenarios should be **repaired** (a selector
+drifted); others should be **refused** (the product behavior changed, so the right answer is to
+leave the failure alone). It is the only way to measure the claim that the tool refuses to guess.
+
+It is **informational** by default: it exits `0` whenever the run completes, whatever the scores.
+With `--enforce-gates` it exits `1` when a [release gate](#release-gates) fails. That is for release
+checks only; nothing gates a merge.
+It is separate from `e2e-healer benchmark`, which only measures prompt tokens.
+
+## Run it locally
+
+The scenarios share one demo app (`examples/demo-app`). `--apply-patches` makes sure the app is in
+each scenario's broken state before it runs, and restores whatever it changed. It needs a git
+checkout, a model API key, and Playwright browsers.
+
+```bash
+cd examples
+pnpm install --frozen-lockfile
+pnpm exec playwright install chromium
+
+CI=1 \
+E2E_HEALER_PLAYWRIGHT_CMD="npx playwright test --reporter=list" \
+E2E_HEALER_WRITE_GLOBS="*.spec.ts,**/*.spec.ts,spec.ts,**/spec.ts" \
+  uv run e2e-healer safety-benchmark \
+    --scenario-root scenarios \
+    --apply-patches \
+    --jobs 4 \
+    --output /tmp/safety-report.json \
+    --markdown /tmp/safety-report.md
+```
+
+- `CI=1` makes Playwright rebuild the preview server for every run. Without it, a server left
+  over from an earlier run is reused and may serve an app without the scenario's change, so the
+  scenario reports `error` ("passed before healing").
+- `--reporter=list` replaces the example config's second reporter, which runs
+  `e2e-healer review` on every failing test. Scenarios fail on purpose, so that would add
+  unrelated model calls and distort latency.
+- `E2E_HEALER_WRITE_GLOBS` is needed because the sandbox's default write globs match
+  `*.spec.ts` and `*.test.ts` style names, and the demo scenarios are literally named `spec.ts`.
+  Without it the repair engine is not allowed to edit them. The command checks this before running
+  anything and exits with code `2`, naming the files, instead of failing every scenario one by one.
+- Progress logs can share stdout with the JSON report. Use `--output` for a clean file.
+- While it runs, stderr shows a progress bar (runs done, elapsed time, estimated time left) and
+  one line per finished run: `✓` when it ended as labeled, `✗` when it did not, `!` for an
+  error, with the refusal reason and latency.
+
+| Flag | Meaning |
+| --- | --- |
+| `--scenario-root` | Directory of labeled scenario folders. Default `examples/scenarios`. |
+| `--apply-patches` | Put the app in each scenario's broken state first (see below). Off by default: scenarios must already be broken. |
+| `--output FILE` | Also write the JSON report. This is the diffable artifact and the format of a baseline. |
+| `--markdown FILE` | Also write the Markdown summary described below. |
+| `--baseline FILE` | A previous JSON report to compare against. A missing file means "no baseline yet". An invalid file exits with code `2`. |
+| `--enforce-gates` | Exit `1` when a release gate fails. A gate whose sample is too small is reported, never failed. |
+| `--repeat N` | Run every scenario `N` times (1 to 10, default 1) and report how often each outcome happened. See [Repeating runs](#repeating-runs). |
+| `--jobs N` | Run `N` scenarios at once (1 to 8, default 1). Needs `--apply-patches`. See [Running in parallel](#running-in-parallel). |
+
+For each scenario, `--apply-patches` finds the demo app in one of three states:
+
+- **Change absent.** The scenario's `change.patch` is applied, and always reversed afterwards, even
+  if the scenario fails.
+- **Change already present.** Some scenarios ship the app pre-broken and keep the patch only as a
+  reference diff (`classname-rename` does). The scenario runs as-is and the app is left exactly as
+  it was found; nothing is reversed.
+- **Neither.** The app no longer matches what the patch describes. That scenario is reported as
+  `error` (it would otherwise be scored on the wrong app) and the run continues.
+
+If a patch that was applied cannot be reversed, the run stops with exit code `1` and writes no
+report, because every later scenario would run on a modified app. The error includes the
+`git apply --reverse` command that restores it.
+
+### Running in parallel
+
+On one checkout the scenarios must run one after another, because each breaks the same demo app.
+Most of that time is Playwright rebuilding the app for every run and waiting on the model, so the
+machine is mostly idle. `--jobs N` gives each of `N` worker processes its own copy of the
+Playwright project (the directory you run from, `examples/`), in a throwaway git repository, with
+its own preview port. Each worker runs exactly the same steps as a sequential run, so the results
+are comparable run for run; only the wall clock changes.
+
+- **What is copied.** The project, minus `node_modules` (symlinked) and build output. Siblings it
+  only reads, such as the Playwright reporter in `integrations/`, are symlinked. A scenario whose
+  patch targets anything outside the project is refused before any worker starts (exit code `2`),
+  because the patch would land in the shared checkout; run that corpus with `--jobs 1`.
+- **Your checkout is never patched.** Uncommitted changes in the project are part of the copy, so a
+  parallel run measures the same working tree a sequential one would.
+- **Worker output** (structured logs, Playwright output) goes to one log file per worker instead of
+  the terminal, where it would interleave. The directory is printed when the run starts.
+- **Model calls run `N` at a time.** Mind the provider's rate limit. On a free NVIDIA developer
+  key, `--jobs 4` with the default model got `429 Too Many Requests` on almost every call, and each
+  scenario ended as `error`; use `--jobs 1` there.
+
+## Reading the report
+
+**Metrics.** Five rates, each shown with the number of scenarios it was computed over:
+
+| Metric | Computed over | Meaning |
+| --- | --- | --- |
+| False-green rate | `product_regression` scenarios | How often a real regression was "repaired". Lower is better. |
+| Repair precision | scenarios that were repaired | How often a repair was one that was expected. |
+| Correct-refusal rate | scenarios labeled `refuse` | How often a refusal was correct. |
+| Incorrect-refusal rate | scenarios labeled `repair` | How often a repairable scenario was refused. |
+| Refusal accuracy | correct refusals + false heals + false refusals | `correct refusals / (correct refusals + false heals + false refusals)`. Penalizes both patching what should be refused and refusing what should be repaired, so refusing a lot does not score well. |
+
+A rate over two scenarios is not evidence. Always read it with its `n`. Errors and skipped
+scenarios are never counted as refusals.
+
+**A provider failure is an error, not a refusal.** When the model provider never returns a usable
+answer (the graph's refusal reason is `provider_error`, for example unparseable output on every
+retry), the model made no judgment about the scenario, so the scenario is scored `error`. Counting
+it as a refusal would make it a *correct* refusal on any scenario labeled `refuse`. As an error it
+fails the `error_count` gate. Every other refusal reason still counts as a refusal.
+
+**A refusal is scored by outcome, not by reason.** The Scenarios table therefore shows the refusal
+reason. A `product_regression` scenario refused with `loop_cap_reached` counts as a correct refusal,
+but `loop_cap_reached` only says the loop ended at its cap. When the model proposes no change at all,
+the run asks it for a verdict on its own diagnosis: if no locator or wait fix could preserve the
+test's intent, the run refuses as `likely_product_regression` in one cycle instead of re-running a
+byte-identical test to the cap. In the checked-in `product-regression` scenario the models diagnose
+the removed submit handler that way, so a run there ending in `loop_cap_reached` means the verdict
+was not decisive. Treat a refusal for `likely_product_regression` or `guardrail_violation` as
+stronger evidence than one for `loop_cap_reached`, and read the reason together with the attempts.
+
+**By class.** Every mutation class is listed, even with no scenarios, so a gap is visible rather
+than silently missing. A separate **Coverage gaps** section names the classes with nothing to
+score. Any number says nothing about those classes.
+
+**Cost and latency.** The report shows total and per-class latency and the mean number of repair
+*attempts* (candidates that proposed at least one change; a candidate where the model declined to
+patch is not counted, so a scenario where it never proposes a fix shows `0`), which tracks model
+spend independently of provider. The **Declined** column counts those empty candidates
+separately. Each one costs a Diagnoser call, a Patch Generator call and a verdict call instead of a
+re-run of the unchanged test, and a `behaviour_change` verdict ends the run there. So `0` attempts
+with `likely_product_regression` is a product regression caught on the first cycle, and several
+declines ending in `loop_cap_reached` is the signature of a model that found nothing to change
+while its verdict stayed unclear.
+**Dollar cost is not measured:** no provider reports usage through the repair graph yet, so the
+report states "not measured" instead of showing zero. Use latency and attempts to spot a change that
+improves accuracy by spending much more.
+
+**Change vs baseline.** With `--baseline`, the Markdown adds a column per scenario (`repair → refuse`
+is highlighted), percentage-point movement per metric, the previous score per class when it changed,
+and the change in total latency and mean attempts. A scenario is compared by which outcomes
+occurred, not how often, so a baseline with one run and a current report with three agree while the
+scenario still ends the same way.
+
+## Repeating runs
+
+Model output varies between runs. In the corpus's first real runs, `split-submit` was repaired once
+and refused twice by the same model, and `delayed-cta` was refused for a different reason each time.
+One run per scenario can therefore move a rate by chance. `--repeat N` runs every scenario `N` times
+and keeps every run:
+
+```bash
+uv run e2e-healer safety-benchmark --scenario-root scenarios --apply-patches --repeat 3 \
+  --output /tmp/safety-report.json --markdown /tmp/safety-report.md
+```
+
+- **It costs `N` times as much.** Every run is a full set of model calls and browser runs, so a
+  corpus that takes ten minutes once takes thirty minutes at `--repeat 3`. The CI workflow does not
+  repeat; use it for a deliberate check, such as before a release or when comparing models.
+- **Passes, not back-to-back repeats.** All scenarios run once, then all run again, so a provider
+  that degrades for a few minutes affects every scenario a little instead of one scenario entirely.
+  A skipped scenario is listed once.
+- **The Scenarios table shows a distribution.** Each scenario lists how many runs ended each way
+  (`repair 2/3, refuse 1/3`), whether it was **Stable** (every run ended the same way), which
+  refusal reasons occurred and how often, and the mean latency, attempts and declines. A scenario
+  can be stable in outcome and still refuse for different reasons; the reasons column shows that.
+  An **Unstable scenarios** section names the ones that flipped.
+- **Rates are fractions of runs.** A scenario that flips between runs moves them in proportion.
+  The `n` next to each rate still counts distinct *scenarios*, and in the By class table the
+  *Scenarios* and *Expected* columns count scenarios while *Repaired*, *Refused*, *Errors* and
+  *Correct* count runs.
+- **In the JSON**, `results` has one entry per run (each with a `run` number), `repeats` says how
+  many runs each scenario had, and `scenarios` has one summary per scenario. A report from before
+  repeats existed reads as one run per scenario, so older baselines still load.
+
+### What repeating does not do for the gates
+
+Repeating a scenario reduces noise, but it does not add coverage. Running the same twenty
+`product_regression` scenarios five times is still twenty scenarios, so the gates keep counting
+**distinct scenarios** toward their minimum sample of 20, and `--repeat` cannot make a thin corpus
+look credible. The rule in the other direction is strict: **a false green in any single run fails
+the `false_green_rate` gate**, so a scenario that is refused four times and repaired once is not
+treated as safe by majority. An errored run counts toward `error_count`.
+
+## Release gates
+
+Decided in [#292](https://github.com/Lee-Dongwook/E2E-Self-Heal/issues/292). Each report carries
+a **Release gates** table:
+
+| Gate | Threshold | Enforced when |
+| --- | --- | --- |
+| `false_green_rate` | `= 0%` | Fails on the first false green, at any sample size. Passes only with 20 or more `product_regression` scenarios; below that, `0%` is not a credible claim. |
+| `refusal_accuracy` | `>= 95%` | 20 or more scenarios in its denominator. |
+| `incorrect_refusal_rate` | `<= 20%` | 20 or more scenarios labeled `repair`. This is the ceiling that stops "refuse everything" from passing the other gates. |
+| `error_count` | `= 0` | Always. A run with errors measured less than it claims. |
+
+- **Below 20 scenarios, a rate is reported as `insufficient_sample`.** It is not enforced. At 20,
+  one scenario is worth 5 points, which is the smallest step a 95% threshold can tell apart.
+  The 20 counts distinct scenarios; [repeated runs](#repeating-runs) of the same scenarios do not
+  add to it.
+- **Every gate says how short it is.** The table's **Needs** column gives the number of distinct
+  scenarios the corpus is still missing, and so does `scenarios_needed` in the JSON. The same
+  thing is printed on stderr, for example `release gates not yet enforced (each needs 20 distinct
+  scenarios): false_green_rate needs 16 more`, so a gate that cannot be enforced yet never looks
+  like one that passed. It is `0` once the rate is enforced, and always `0` for `error_count`,
+  which has no sample minimum.
+- **Gates block a release, never a merge.** Pull request and `main` runs stay informational.
+  Before tagging a release, run the benchmark with `--enforce-gates` (see
+  [Releasing](https://github.com/Lee-Dongwook/E2E-Self-Heal/blob/main/docs/RELEASING.md)). Do not
+  release on exit code `1`.
+- **The corpus is the limit.** Thresholds are only as strong as the scenarios behind them. Most
+  `product_regression` scenarios are paired with a drift scenario that looks the same from the diff
+  (`id-rename` and `id-rename-submit-dropped`, `classname-rename` and
+  `cta-rename-handler-dropped`), so the gates measure discrimination, not the absence of hard cases.
+
+### The corpus
+
+The checked-in corpus is 45 scenarios: 44 runnable and one static fixture (`jsx-context`, listed as
+`skipped` and in no rate). Every rate gate is therefore enforceable on a full run, and the corpus
+cannot shrink without a gate going back to `insufficient_sample`:
+
+| Population | Scenarios scored | Used by |
+| --- | --- | --- |
+| `product_regression` | 20 | `false_green_rate` gate |
+| labeled `refuse` | 22 | `correct_refusal_rate` (reported, not a gate) |
+| labeled `repair` | 22 (23 minus `jsx-context`) | `incorrect_refusal_rate` gate |
+| judged (expected refuse, or actually refused) | 22 or more | `refusal_accuracy` gate |
+
+Sixteen of the regressions come in **pairs** on four demo-app pages: `<page>-<behaviour>-drift`
+renames a selector and should be repaired, and `<page>-<behaviour>-regression` makes the same
+rename and also breaks the behavior the spec asserts, so it should be refused. Both twins ship the
+identical spec and the same failing selector, so a model that gets one right and the other wrong
+is measured on discrimination rather than on how easy the corpus is.
+
+The pairs vary both halves so the twenty regressions are not one mutation repeated:
+
+- **Renames:** an id or class renamed, an id or class replaced by a `data-testid`, or an id
+  replaced by a `name` attribute.
+- **Breaks:** a deleted event handler (on the renamed element or on a sibling), a wrong
+  computation (subtotal, sort order, search predicate, coupon check), a handler that writes the
+  wrong value or reads the wrong field, a handler bound to the wrong event, a broken guard, an
+  inverted condition or label, and output that no longer reads state. Several of these sit outside
+  the JSX the diff analyzer abstracts, so the model sees only the rename.
+
+Distinct is still not independent: the pairs share four small pages and one author, so read a
+0% false-green rate as "no false green on these twenty", not as a population estimate.
+`tests/test_safety_benchmark.py` fails if a drift scenario has no regression twin, or if the
+checked-in corpus can no longer enforce every rate gate.
+
+The four pages the paired scenarios run against, as rendered by `vite preview`:
+
+![The catalog page](/img/scenarios/catalog.png)
+![The checkout page](/img/scenarios/checkout.png)
+![The settings page](/img/scenarios/settings.png)
+![The account page](/img/scenarios/account.png)
+
+## Labeling a scenario
+
+Each scenario is a folder under the scenario root:
+
+```text
+scenarios/id-rename/
+  spec.ts        # exactly one Playwright test file
+  change.patch   # git patch (repo-root-relative paths) that breaks the demo app
+  meta.json
+```
+
+```json
+{
+  "class": "selector_drift",
+  "expected_outcome": "repair",
+  "failing_selector": "#submit-btn",
+  "rationale": "The button identifier changed while its behavior remains intact."
+}
+```
+
+`class` is one of `selector_drift`, `accessible_name_drift`, `timing`, `ambiguous`,
+`product_regression`, `environment`. `expected_outcome` is `repair` or `refuse`. `rationale` is
+required. Every folder under the scenario root is a scenario. A folder without `meta.json`, an
+unknown `class` or `expected_outcome`, an empty `rationale` or an unknown key fails the run at load
+time (exit code `2`) instead of silently dropping the scenario. The token benchmark
+(`e2e-healer benchmark`) reads the same corpus. Add `"runnable": false` for a static fixture that is labeled but is not a Playwright test
+(for example the prompt-context fixture used by the token benchmark). It is listed as `skipped` and
+excluded from every rate.
+
+Add scenarios in pairs, as described under [The corpus](#the-corpus). Two further rules: the spec
+must not contain a comment (the model reads the spec, and a comment saying "this is a regression"
+hands it the label), and the spec should pass on the unpatched app, so the patch is what breaks it.
+`classname-rename` is the one exception to the second rule: the demo app ships with its rename
+already applied, because the Playwright reporter uses that patch as its `diffFile` fixture. A patch
+must therefore either apply to the current app or already be applied to it, which is what
+`test_every_runnable_checked_in_scenario_matches_the_demo_app_in_some_state` enforces.
+
+## In CI
+
+`.github/workflows/safety-benchmark.yml` runs the benchmark on Google's free Gemini tier
+(`gemini-3.5-flash-lite`, through the generic `openai` provider and Gemini's OpenAI-compatible
+endpoint) and publishes the Markdown report as the run's step summary. That is a CI choice, not
+the engine's default provider: it passed every gate on a free key, where the free NVIDIA models
+either re-typed the lines they patched or were rate-limited into errors. The `safety-report`
+artifact holds the JSON and Markdown reports. With `--jobs` above 1, the `safety-worker-logs`
+artifact holds each worker's log, redacted file by file before upload and published only if that
+redaction succeeded; at `--jobs 1`, the default in CI, the same output is in the job log itself.
+Either way, when a scenario ends as `error`, its log has the provider's actual response.
+
+- **Never blocks.** The job is `continue-on-error`, time-limited (120 minutes), and has read-only
+  permissions. It runs one scenario at a time (`--jobs 1`): free tiers limit requests per minute,
+  and on a free NVIDIA key four workers calling a fast model got `429 Too Many Requests` on almost
+  every call. Runs for different refs (`main`, the weekly schedule, pull requests) share one job
+  concurrency group, so they take turns on the key instead of calling it at once; GitHub keeps one
+  pending run per group, so a newer pending run replaces an older one. There is no partial-corpus
+  mode for pull requests: a subset would hide a regression, and a run over fewer scenarios already
+  reports its own `n` and `insufficient_sample` rows.
+- **A provider glitch fails a run.** If the model returns unparseable output on every retry of a
+  scenario's final attempt, that scenario is an `error` and `error_count` fails, whatever the
+  outcomes. Rate limiting (`429`) ends the same way once retries are exhausted, so read a
+  single error by its scenario's `error` text, or the log, before re-running.
+- **Skipped without a key.** It runs only when the `E2E_HEALER_GEMINI_API_KEY` repository secret
+  is set, so pull requests from forks, which cannot read secrets, skip it instead of failing. It
+  uses the `pull_request` trigger, never `pull_request_target`, so a fork's code never runs with
+  the key. A free key from [Google AI Studio](https://aistudio.google.com/apikey) is enough; take
+  it from a Google Cloud project without billing enabled, so going over the free tier's limits
+  answers `429` instead of billing. Google may use free-tier requests to improve its products,
+  which is acceptable here because the job sends only the demo app and its scenarios.
+- **About two runs a day.** The free tier caps `gemini-3.5-flash-lite` at 500 requests per day per
+  Google Cloud project (resetting at midnight Pacific time), and one run makes roughly 150 to 250.
+  A run that goes over can end scenarios as `error`, with `RESOURCE_EXHAUSTED` in the
+  log. Give the CI key a project of its own, so local runs never spend its quota, and start a run
+  you mean to keep, such as a baseline, early in the quota day.
+- **Runs when it can matter.** On pushes to `main`, weekly (Mondays at 08:17 UTC, after the free
+  quota resets), on demand, and on pull requests that change `app/`, `examples/`, `benchmarks/` or
+  the dependency files, so documentation-only changes spend no model calls.
+
+### Setting a baseline
+
+The comparison reads `benchmarks/safety-baseline.json`. Until that file exists the report simply
+has no deltas. A baseline only means something against the same model and the same number of
+runs per scenario (the latency delta compares totals), so take it from an ordinary single-pass
+run of the CI workflow, the same shape as every run it is compared with:
+
+1. Start a manual run on `main`:
+
+   ```bash
+   gh workflow run safety-benchmark.yml --ref main
+   ```
+
+2. Download that run's report. Filter on the manual trigger, so a newer push or scheduled run is
+   not picked up instead:
+
+   ```bash
+   gh run list --workflow safety-benchmark.yml --event workflow_dispatch --branch main --limit 1
+   gh run download <run-id> -n safety-report
+   ```
+
+3. Review it before committing: `error_count` should be 0 and every scenario should end as
+   labeled. A provider failure in the baseline makes every later comparison noisy.
+4. Commit `safety-report.json` as `benchmarks/safety-baseline.json` in a pull request. That pull
+   request touches `benchmarks/`, so both its own run and the run on `main` after it merges start
+   the benchmark. With the manual run, that is three runs, more than the free tier's daily quota
+   allows: cancel the pull request's run, which a baseline file cannot affect, and let the run on
+   `main` show the first deltas. If the day's quota is already partly spent, merge the next day.
+
+Regenerate the baseline when the CI model changes. Latency is part of the file, so expect it to
+change a little on every refresh.

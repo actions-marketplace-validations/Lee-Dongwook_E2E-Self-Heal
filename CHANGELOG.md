@@ -7,6 +7,328 @@ All notable changes to this project are documented here. The format is based on
 ## [Unreleased]
 
 ### Added
+- **The CI safety benchmark keeps its worker logs** (#402). Each `--jobs` worker's log is uploaded
+  as a `safety-worker-logs` artifact, so a scenario scored as `error` shows the provider's actual
+  response instead of only "the model provider did not return a usable answer". The safety
+  benchmark reference describes how to generate and commit the baseline from a manual CI run.
+- **The configuration reference lists free hosted tiers that work** (#416): Gemini
+  `gemini-3.5-flash-lite`, Groq `qwen/qwen3.8-27b` and NVIDIA `minimax-m3.1-flash`, each with its
+  settings, its result on the full safety benchmark corpus, its limits, and the data-use caveat of
+  free tiers.
+
+### Fixed
+- **The default NVIDIA model is `minimaxai/minimax-m3.1-flash`** (#402, #405). The previous default,
+  `openai/gpt-oss-120b`, reached end of life on NVIDIA's API on 2026-09-03 and answers every call
+  with `410 Gone`, so `E2E_HEALER_LLM_PROVIDER=nvidia` without an explicit model ended every run in
+  `provider_error`. A probe of the models a free NVIDIA developer key can call, using the engine's
+  own client and prompts, found `minimax-m3.1-flash` the only one that passed the plain
+  completion, a strict-schema patch the engine applied with the correct fix, and the
+  strict-schema verdict, at 1-3 s per call. `openai/gpt-oss-20b`, briefly the default, answered
+  but re-typed the line it patched, so the engine rejected its patches (#404). An explicit
+  `E2E_HEALER_LLM_MODEL` or `E2E_HEALER_NVIDIA_MODEL` is unaffected.
+- **The `examples-heal` CI job can write its scenario file** (#402). It had never run, because it
+  needs the NVIDIA key; once the key existed, the sandbox denied the write to `spec.ts`, which the
+  default write globs (`*.spec.ts`) do not match. The job now sets the same write globs as the
+  safety benchmark, and is a blocking check again now that #404 is fixed.
+- **A patch whose quoted line was re-typed is no longer rejected** (#404). The Patch Generator
+  names the line it replaces by quoting it, and the engine required that quote to match the file
+  character for character. Models often re-type it instead (single quotes for double, the
+  indentation dropped), so correct patches were rejected as stale and runs ended at the loop cap:
+  84 such rejections in one CI benchmark with `openai/gpt-oss-20b`, 4 with `minimax-m3.1-flash`. A
+  quote that differs from the line only in whitespace and quote style now counts as that line,
+  and the replacement is written in the file's formatting: when only string values change (the
+  usual selector fix), the file's own line is rebuilt with the new values. A line with a template
+  literal, comment or regex still has to match exactly, a quote of a different or changed line is
+  still rejected, and the scope gates and the AST lock judge the line actually written.
+
+### Changed
+- **The CI safety benchmark runs one scenario at a time** (#405). With the faster default model,
+  four workers on a free NVIDIA key got `429 Too Many Requests` on almost every call and 41 of 44
+  scenarios ended as `error`. The workflow now passes `--jobs 1`, and the safety benchmark
+  reference says to do the same on a free key.
+- **The CI safety benchmark runs on a free Gemini key** (#408). It reads the
+  `E2E_HEALER_GEMINI_API_KEY` secret and runs `gemini-3.5-flash-lite` through the generic `openai`
+  provider and Gemini's OpenAI-compatible endpoint, still one scenario at a time. On the free
+  NVIDIA tier, `openai/gpt-oss-20b` failed `refusal_accuracy` and `incorrect_refusal_rate` because
+  it re-typed the lines it patched (#404), and `minimax-m3.1-flash` was rate-limited. A clean local
+  run of the full corpus on the free Gemini tier scored all 44 scenarios as labeled with every gate
+  passing. Runs for different refs share one job concurrency group, so `main`, the weekly run and
+  pull requests take turns on the key instead of adding up against its per-minute limit. The
+  engine's default provider is unchanged. The weekly run moved from Monday 05:17 UTC to 08:17 UTC,
+  after the free tier's daily quota resets, so it no longer gets the previous day's leftovers
+  (#411).
+
+### Security
+- **Parallel safety-benchmark workers redact their logs** (#402). With `--jobs`, each worker
+  process wrote its log with structlog's defaults: tracebacks rendered every frame's local
+  variables, and the log redaction never ran. A provider error raised where a local held the API
+  key wrote the key into `worker-<n>.log`. Workers now use the same logging configuration as the
+  CLI (plain tracebacks, redacted). The CI workflow, which now uploads those logs, names its model
+  key in `E2E_HEALER_SENSITIVE_ENV_VARS` and redacts every log file
+  before upload, which also covers raw writes to stdout and stderr; the logs are published only
+  if that step succeeds. Logs from earlier local `--jobs` runs may contain a key and should be
+  deleted.
+- **Sequential safety-benchmark runs redact their logs** (#413). `e2e-healer safety-benchmark`
+  was the one model-calling command that never configured logging, so a run without `--jobs`
+  (the default) logged with structlog's defaults: on stdout, tracebacks rendering every frame's
+  local variables, and no redaction, so `E2E_HEALER_SENSITIVE_ENV_VARS` had no effect. A provider
+  failure could print the API key or a request header. The command now uses the same logging
+  configuration as `heal` and `review`. Output from earlier local sequential runs may contain a
+  key; don't paste it anywhere without checking.
+
+## [0.6.0] - 2026-10-25
+
+The first release whose safety gates are enforced on a corpus large enough to mean something:
+44 runnable scenarios, 20 of them product regressions paired with a drift twin. The release run
+(`safety-benchmark --apply-patches --jobs 4 --enforce-gates`, Claude Sonnet 4.6) scored all 44 as
+labeled: `false_green_rate` 0% (n=20), `refusal_accuracy` 100% (n=22), `incorrect_refusal_rate` 0%
+(n=22), `error_count` 0.
+
+### Known issues
+- With `deepseek-v4-flash`, a run can occasionally end as `provider_error` because the model
+  returns an empty answer on every retry, most often on long product-regression diagnoses. A
+  higher `E2E_HEALER_LLM_MAX_TOKENS` (for example `16384`) appeared to help in a small test.
+
+### Added
+- **The repair loop's control flow is in the result, schema `2.3`** (#375). `evidence.path` lists
+  every graph node the run executed with its loop count, so a rejected candidate followed by a new
+  attempt reads as one ordered trace (`…, test_runner, diagnoser, patch_generator, …`). Each
+  candidate's `next_step` names where the router sent the run once it was accepted or rejected (or
+  `end`), `evidence.loop_budget` states the cap, and a new `termination` on repairs and refusals
+  says how the run ended: `verified`, `refused` (any refusal reason but the loop cap),
+  `budget_exhausted` (the cap, with no verifier rejecting the last candidate) or
+  `verification_failed` (the cap after a verifier rejected it, or a repair the final suite rerun
+  rejected). The path is recorded by a wrapper around each node in `build_graph`, at the moment the
+  node runs, so the routers are unchanged and nothing re-derives their decisions; the same steps go
+  to the log as `graph_step`, and `repair_run_finished` now carries `loop_budget` and
+  `termination`. All four are optional additions, so `2.3` is a compatible minor bump; node names
+  are an open set, `termination` is closed.
+- **`safety-benchmark --jobs N` runs scenarios in parallel, with live progress.** Scenarios
+  share one demo app, so they ran one after another and a full corpus took about 29 minutes,
+  mostly Playwright rebuilding the app and model latency. With `--jobs N` each of `N` worker
+  processes gets its own copy of the Playwright project in a throwaway git repository and its
+  own preview port, and runs the same executor as a sequential run. A corpus whose patches reach
+  outside the project is refused up front (exit `2`), and worker output goes to per-worker log
+  files. The full 43-scenario run with `deepseek-v4-flash` took 8 min 15 s at `--jobs 4` against
+  about 29 min sequentially, with 43 scored and 0 errors. Every run now shows a progress bar (done,
+  elapsed, ETA) and one line per finished scenario on stderr. The CI workflow uses `--jobs 4`.
+- **The safety corpus is large enough to enforce the release gates** (#383). The corpus grew from
+  12 scenarios to 44 (43 runnable), so every rate gate now has its 20 distinct scenarios and is
+  enforced on a full run instead of reported as `insufficient_sample`. Four routed demo-app pages
+  (`#/catalog`, `#/checkout`, `#/settings`, `#/account`) carry four drift/regression pairs each:
+  the drift patch renames a selector and should be repaired, and the regression patch makes the
+  same rename and also breaks the asserted behavior, which should be refused. Renames (id, class,
+  `data-testid`, `name`) and breaks (deleted handler, wrong computation, wrong value or field,
+  wrong event, broken guard, inverted condition, output detached from state) vary across the
+  pairs, so the twenty regressions are not one mutation repeated. Both twins ship the identical
+  spec and the same failing selector, so the gates measure discrimination rather than how easy the
+  corpus is. New tests fail if the checked-in corpus can no longer enforce every rate gate or if a
+  drift scenario has no regression twin. The hash-routed `App.tsx` keeps `/` on the signup page,
+  and the demo port moved to a validated `E2E_DEMO_PORT` so worktrees can run the suite
+  concurrently; the CI timeout is 120 minutes for the larger corpus. `wrong-base-url` now points
+  at port 47, which nothing serves, instead of 4174, which a second checkout or the demo page may.
+  One model-backed run over the new corpus (`deepseek-v4-flash`) scored 43 scenarios with no
+  errors and enforced every gate: `false_green_rate` 0% (n=20) and `incorrect_refusal_rate` 9.5%
+  (n=21) pass, and `refusal_accuracy` 87.5% (n=24) **fails** its 95% floor. The misses are
+  `account-avatar-drift` (refused on `guardrail_violation` for a multi-line `setInputFiles` call),
+  `settings-notifications-drift` (refused on `insufficient_evidence` for an id replaced by `name`)
+  and the existing `split-submit` (repaired, expected refuse).
+- **The safety benchmark now states each gate's shortfall** (#383). Every rate gate reported
+  `insufficient_sample` and nothing said how far a population was from the 20 distinct scenarios
+  it needs, so a gate that could never be enforced read like one that passed. `GateResult` gains
+  `scenarios_needed` (defaulted, so older reports and baselines still load), the **Release gates**
+  table gains a **Needs** column, and a run prints one line on stderr naming the gates that are
+  still unenforced with the largest shortfall first. `error_count` is always `0`, since it has no
+  sample minimum.
+- **`--repeat N` for the safety benchmark** (#325). Model output varies between runs, so one run
+  per scenario can move a rate by chance (`split-submit` was repaired once and refused twice by the
+  same model). `e2e-healer safety-benchmark --repeat 3` runs every scenario three times, in full
+  passes, and the report shows how often each scenario ended each way, which refusal reasons
+  occurred, and which scenarios were unstable. Rates are fractions of runs. The gate sample still
+  counts distinct scenarios, because repeating a scenario adds no coverage, and a false green in any
+  single run fails the false-green gate. The JSON gains `run`, `repeats` and `scenarios`; older
+  reports and baselines still load, and a single-run report is unchanged.
+- **JSON output reference** (#293). A new docs page documents every field of the schema `2.1`
+  `--json` contract (`RepairSummary`, `RefusalReport`, `SuiteSummary`, `ReviewReport` and every
+  nested object), when a document is emitted and with which exit code, and each `RefusalReason`.
+  Its examples are payloads captured from real CLI runs instead of hand-written ones, and a test
+  fails when a field or a captured payload drifts from the models in `app/schemas.py`.
+- **Labeled mutation corpus and release gates for the safety benchmark** (#281). The corpus now
+  covers all six mutation classes (12 scenarios), including `ambiguous`, `environment` and four
+  `product_regression` cases, two of which look the same from the diff as a drift scenario
+  (`id-rename-submit-dropped`, `cta-rename-handler-dropped`). Every scenario folder must carry
+  a valid `meta.json`; a missing file, unknown class or key, or empty rationale fails at load time
+  (exit `2`) instead of being skipped. The token benchmark reads the same corpus, with unchanged
+  numbers for the existing scenarios (#289). A new `refusal_accuracy` metric and a **Release
+  gates** table (false-green 0%, refusal accuracy ≥ 95%, incorrect refusals ≤ 20%, no errors; rate
+  gates enforced only from 20 scenarios) are added to the report, and `--enforce-gates` exits `1`
+  when one fails. Gates block a release, never a merge (#292). The shadow replay spec moved from
+  `examples/scenarios/` to `examples/shadow-replay/`, since it is not a mutation scenario.
+- **Safety benchmark report and non-blocking CI job** — `e2e-healer safety-benchmark` now
+  reports results per mutation class (all six classes are listed, so coverage gaps are visible),
+  the number of scenarios behind each rate, total and per-class latency, and mean repair
+  attempts (candidates that proposed a change; a model that declines to patch reports 0) and,
+  separately, how many times it declined to patch.
+  `--output` writes the diffable JSON report, `--markdown` a summary, and `--baseline`
+  compares against a previous run (outcome flips, percentage-point movement, latency and
+  attempts). `--apply-patches` breaks the demo app with each scenario's `change.patch` and always
+  reverses it, which the runner previously left to the caller, so on a clean checkout every
+  scenario used to report `error`. A scenario whose change is already present (the demo app
+  ships `classname-rename` pre-broken) runs as-is and the app is left as found. A new
+  `safety-benchmark` workflow publishes the report as a step summary and artifact. It is
+  `continue-on-error`, read-only, and skipped when the model key is unavailable (for example on
+  fork pull requests). Model cost in dollars is not measured yet and is reported as such, never
+  as zero (#291).
+- `runnable: false` in a scenario's `meta.json` marks a labeled static fixture that is not a
+  Playwright test. It is listed as `skipped` and excluded from every rate. The `jsx-context`
+  token-benchmark fixture is marked this way; it would otherwise have been scored as a failed
+  repair (#291).
+
+### Fixed
+- **A test whose element became several look-alikes is refused, not guessed** (#388). On
+  `split-submit` one `Submit` button becomes "Save draft" and "Publish"; either makes the test
+  pass, so the model picked one and the run read as a repair. A deterministic check
+  (`app/preprocess/ambiguous_target.py`) now refuses as `ambiguous_target` before any model call
+  when the diff removes the element the failing locator named (by `id`, class, `data-testid` or
+  `name`) and adds two or more elements of the same tag and `type` in the same file. A
+  `--selector-hint` disables it, and role or text locators never trigger it. The refusal spends no
+  loop and writes nothing; the added elements are already in `evidence.dom_diff_context`, and the
+  log event `ambiguous_target_detected` names their selectors. No JSON field changed. Across the
+  corpus it fires for `split-submit` only, and a new guard scenario,
+  `submit-rename-reset-added` (Submit renamed with a Reset button added beside it), must still be
+  repaired.
+  Two full `deepseek-v4-flash` runs at `--jobs 4` (44 scored each) refused `split-submit` as
+  `ambiguous_target` with no model call (about 7 s) and repaired the guard scenario. The second run
+  ended with every scenario as labeled: `refusal_accuracy` 100% (n=22), `incorrect_refusal_rate`
+  0% (n=22), `false_green_rate` 0% (n=20), 0 errors. The first run also scored every scenario as
+  labeled but one: the model returned unparseable structured output three times in a row on
+  `catalog-search-regression`, which is correctly scored as an `error` and fails `error_count`.
+  That is model output, not `--jobs`: the logs show no rate limiting, and the sequential runs of
+  #383 had as many unparseable answers (26 against 24) and four exhausted patch retries, which
+  happened to recover on a later loop.
+- **A late-rendering element gets a longer wait, not a guessed selector** (#388). On
+  `delayed-cta` the CTA renders four seconds after load, so the 3 s click times out and the
+  failure snapshot has no button. The diff abstraction keeps tags and attributes only, so nothing
+  told the model the `.cta-primary` class still existed, and it swapped in whatever was on the
+  page (`role=region[name="Get started"]`) or declined as a product regression: 1 repair in 4 runs,
+  and that one rewrote the selector too. A new deterministic check
+  (`app/preprocess/selector_diff_check.py`) reports when no line removed by the diff names anything
+  in the failing locator; the Diagnoser and Patch Generator prompts then state that the selector
+  was not renamed, so the fix for a timed-out action is its timeout option. The check is
+  conservative: a rename always removes a line holding the old name, so it never fires for one.
+  On the corpus it fires for `delayed-cta` and `product-regression` only. `delayed-cta` now
+  repairs as `page.click(".cta-primary", { timeout: 15000 })` in 6 of 6 runs, and
+  `product-regression` is still refused in 6 of 6.
+  A full `deepseek-v4-flash` run over the corpus (43 scored, 0 errors) passes every release gate
+  for the first time: `false_green_rate` 0% (n=20), `refusal_accuracy` 95.5% (n=22) and
+  `incorrect_refusal_rate` 0% (n=21). The one miss left was `split-submit` (ambiguous, repaired),
+  fixed by the ambiguous-target check above.
+- **Selector repairs on multi-line Playwright calls are no longer refused** (#388). The
+  action-argument gate masked selectors on the edited line alone, so a call such as
+  `page.setInputFiles("#avatar", {` with its payload on later lines never matched and every
+  selector-only edit was rejected as changing another argument, ending in `guardrail_violation`.
+  The gate now compares the whole original and patched source; changes to any other argument are
+  still rejected.
+- **Attribute edits inside multi-line JSX tags reach the model** (#388). `analyze_diff` parsed
+  each run of changed lines on its own, so renaming `id=` on the line below `<input` produced no
+  DOM change at all. Such a run is now widened to the whole opening tag (to its closing line, or a
+  synthetic close at the hunk edge); other context lines are still not parsed, so unchanged
+  neighbours are not reported.
+- **The failure-time page snapshot survives truncated result directories** (#388). Playwright
+  shortens long `test-results/` names, which then no longer contain the spec name, and 16 of 43
+  benchmark scenarios ran without a snapshot. The context is now matched on the test location
+  recorded in `error-context.md`, with directory-name matching kept for artifacts that lack it.
+  With all three fixes, a `deepseek-v4-flash` run over the 44-scenario corpus repairs both drifts
+  it refused before (each also repaired 3 of 3 in a repeat run) and finds every failure snapshot.
+  The remaining `delayed-cta` instability is fixed by the selector diff check above; the full run
+  after it is reported there.
+- **A declined patch is a signal, not a reason to re-run the test** (#330). When the model
+  proposes no change it now gets one structured verdict on its own diagnosis: `selector_drift`,
+  `behaviour_change` or `unclear`. `behaviour_change` refuses immediately as
+  `likely_product_regression`, a reason that was defined but emitted by nothing, so a product
+  regression is reported for what it is after one cycle instead of three. The other two verdicts
+  keep the full attempt budget, and the verdict is asked at most once per run because a decline
+  leaves every later cycle's prompt unchanged. The verdict is internal, so the `--json` contract
+  changes only in the reason a refusal can carry.
+- The safety benchmark now gives the repair graph Playwright's failure-time page snapshot, as
+  `e2e-healer heal` does. It passed an empty snapshot, so a label change was invisible to the
+  model (the diff analyzer records attribute changes, not text) and `label-rename` could never be
+  repaired in the benchmark although the CLI repairs it (#328).
+- Shadow replay no longer drops repeated HTTP headers when parsing a HAR or Playwright trace.
+  Each repeat used to overwrite the one before, so a response with two `Set-Cookie` headers
+  kept only the last. Repeats are now folded the way Playwright represents them: `Set-Cookie`
+  values are joined with a newline and any other repeated header with `, `, grouped
+  case-insensitively with the first spelling kept. The snapshot schema is unchanged, so saved
+  snapshots load as before (#226).
+- `classname-rename`'s `meta.json` named `.submit-btn` as the failing selector; its spec clicks
+  `.cta-button`. The label now matches (#291).
+- The safety benchmark scored a model-provider failure (for example unparseable structured
+  output on every retry, refusal reason `provider_error`) as a refusal. On a scenario labeled
+  `refuse` that counted as a correct refusal and hid the outage. It is now an `error`: it fails
+  the `error_count` gate and is outside the refusal-accuracy population (#326).
+
+### Changed
+- **Learning never lowers the refusal bar is now a stated, tested invariant** (#308). Healing
+  history, and any learned rule or policy setting added later, may reorder candidates or save a
+  model call but never skip, relax or replace a refusal check or verification step. It is written
+  down in `.claude/CLAUDE.md`, `CONTRIBUTING.md` and the README, the pull request template asks
+  every learning or policy change to confirm it, and a test shows that a matching history record
+  cannot pre-empt the ambiguous-target refusal: the run is refused before history is consulted,
+  and the file is left as it was.
+- **Structural AST lock on every patch** — the Patch Generator and the healing-history memory
+  lookup now verify each candidate against the original file with the tree-sitter AST lock,
+  after the existing per-line scope gates. Only locator strings, timeouts, and wait-method names
+  may differ; any other structural change, or a file that does not parse, is rejected fail-closed
+  as a `guardrail_violation`. A Patch Generator rejection is fed back to the generator and
+  **spends a loop**, so repeated violations stop at `max_loops` and end in a `RefusalReport`.
+  A rejected history candidate is treated as a cache miss: it is recorded as a rejected
+  candidate, does not increment the loop count, and falls through to the LLM path (#286).
+- The AST lock now treats the first argument of a `page.<action>(selector, ...)` call (`click`,
+  `fill`, `waitForSelector`, ...) as an editable selector, matching the existing scope gate.
+  Values, keys, options, and non-`page` receivers stay locked (#286).
+
+### Removed
+- Code nothing ran, found in a dead-code sweep:
+  - The failure-cause aggregation in `app/registry.py` (`FailureCause`, `HealingRecord`,
+    `aggregate_failure_stats` and its stats models). Nothing ever produced a `HealingRecord`.
+    `SelectorKind` and `classify_selector_kind` stay, because the healing-history store uses them.
+  - The TypeScript Markdown report generator in `app/core/report/` and the root `package.json`
+    that existed only to run its Vitest test. No CLI command, Action step or workflow called it.
+  - Unused internals: `selector_verifier._revert` (rollback writes the saved code directly),
+    `PreparedEvidence.redaction_applied` (callers read `redaction_count`),
+    `PlaywrightTraceParser._headers_to_dict` and the unreferenced `SnapshotMetadata` model.
+  - The default Docusaurus scaffold left in the docs site: the unused `HomepageFeatures`
+    component, its illustrations, `docusaurus.png` and the unlisted `/markdown-page` page.
+  - The product dashboard's fallback to `/api/info`, an endpoint the API never had.
+- Tests that checked nothing a user or CI depends on (#395): exact log, help and prompt prose, mocks
+  echoing their own arguments, incidental defaults, bare `isinstance` checks and same-branch
+  duplicates. Near-identical cases became parametrized tables, and test files covering the same
+  module were merged (`test_patch_apply.py` into `test_patch_generator.py`,
+  `test_ast_lock_corpus.py` into `test_ast_lock.py`, the three snapshot-store files into
+  `test_snapshot_store.py`, `test_aria_snapshot_identity.py` into `test_aria_snapshot.py`,
+  `test_selector_check_concurrent.py` into `test_selector_check.py`). The suite went from 65 test
+  files and 1,100 tests to 59 files and 1,061 tests, with every `app/` line and branch still covered as
+  before (92.69%). Guardrail, refusal, exit-code and JSON-contract tests were only deduplicated, and
+  `pytest.raises(..., match=)` stays wherever it shows which gate rejected a patch.
+- `README_AR.md`, a partial Arabic translation whose language links pointed at files that do not
+  exist. `README.ar.md` follows the naming of the other translations and stays.
+
+### Security
+- **One redaction boundary for every prompt and every log line** (#377). The Diagnoser, Patch
+  Generator, Reviewer and decline verdict now build their prompts from the same prepared evidence,
+  so the failure log, DOM diff, ARIA snapshot and model-reported analysis are redacted once instead
+  of per call site; the failure line number is still taken from the raw log, so redaction cannot
+  shift where a fix is applied. Built-in credential patterns are joined by two new settings:
+  `E2E_HEALER_SENSITIVE_ENV_VARS` (variable **names**, resolved at redaction time so their values
+  never enter the settings object) and `E2E_HEALER_SENSITIVE_VALUES` (literals, held as masked
+  secrets). A mistyped name or a literal shorter than four characters fails at load rather than
+  redacting nothing. Structured-log events pass through the same redaction before rendering,
+  including exception text. Test source is deliberately **not** redacted — name a hard-coded
+  credential in `SENSITIVE_VALUES` to keep it out of a prompt.
+
+## [0.5.0] - 2026-09-22
+
+### Added
 - **Repair/refusal evidence bundle** — `--json` now emits schema `2.0` results with a
   deterministic, redacted evidence bundle: parsed failure and selector, DOM context, ARIA snapshot
   reference, candidate verification scores, and loop history. Terminal failures emit a first-class
@@ -17,10 +339,6 @@ All notable changes to this project are documented here. The format is based on
   Playwright subprocess cwd) to a project root. This lets programmatic integrators (e.g. a
   Playwright Reporter) invoke the CLI from an arbitrary working directory — the explicit
   equivalent of the shell wrapper's `cd $working-directory` (#301).
-
-## [0.5.0] - 2026-08-29
-
-### Added
 - **Self-describing JSON contract** — every `--json` summary (`RepairSummary`, `SuiteSummary`,
   `ReviewReport`) now carries a `schema_version` (currently `"1.0"`) and a `kind`
   discriminator (`"repair"` / `"suite"` / `"review"`) so CI wrappers can detect breaking
@@ -98,7 +416,7 @@ Preview release. Everything below is shipped and tested; the surfaces added here
   spec files and their directories, `playwright` in `package.json`, configured LLM provider
   and API key) and prints a rich status table. `--scaffold` additionally writes a starter
   GitHub Actions workflow so a repo can wire the healer into CI in one step, and `--force`
-  overwrites an existing one (#126, #144).
+  overwrites an existing one (#126).
 - **`--selector-hint`** on `heal` — accepts a JSON `SelectorHint` (`role` / `testid` / `text`
   / `css`, plus the original selector and a confidence score) so a human, or a DOM picker,
   can pinpoint the intended target instead of leaving it to inference (#119).
@@ -253,7 +571,8 @@ Preview release. Everything below is shipped and tested; the surfaces added here
 - LLM provider migrated from OpenAI to NVIDIA NIM (`openai/gpt-oss-120b`) via the
   OpenAI-compatible endpoint; Structured Outputs guardrail retained.
 
-[Unreleased]: https://github.com/Lee-Dongwook/E2E-Self-Heal/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/Lee-Dongwook/E2E-Self-Heal/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/Lee-Dongwook/E2E-Self-Heal/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/Lee-Dongwook/E2E-Self-Heal/compare/v0.5-pre...v0.5.0
 [0.5.0-pre]: https://github.com/Lee-Dongwook/E2E-Self-Heal/compare/v0.4.0...v0.5-pre
 [0.4.0]: https://github.com/Lee-Dongwook/E2E-Self-Heal/compare/v0.3.0...v0.4.0

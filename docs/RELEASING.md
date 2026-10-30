@@ -57,7 +57,17 @@ pip install --index-url https://test.pypi.org/simple/ \
 
 1. `make check && make test` green locally, and CI green on `main`.
    Optionally rehearse first via **Actions → publish-testpypi** (see 2b above).
-2. Bump `version` in `pyproject.toml`; move the `## [Unreleased]` section in
+   Then run the safety benchmark with `--enforce-gates` (the
+   [local command](../docs-site/docs/reference/safety-benchmark.mdx#run-it-locally) plus that
+   flag). Exit code `1` means a release gate failed: do not release. `insufficient_sample` rows do
+   not block; they mean the corpus is still too small for that rate to be enforced, and each such
+   row's **Needs** column (also `scenarios_needed` in the JSON, and the last line on stderr) says
+   how many more distinct scenarios it is missing.
+2. Bump `version` in `pyproject.toml` and the `ai-driven-e2e` version line in **both** lockfiles:
+   `uv.lock` and `product/api/uv.lock`. The product API locks the core as an editable path
+   dependency, so its lockfile records the core version too; if it is stale, the `api` job's
+   `uv sync --locked` fails. Change only that line if your local `uv` would rewrite the lockfile's
+   `revision`. Then move the `## [Unreleased]` section in
    [`CHANGELOG.md`](../CHANGELOG.md) to the new version with today's date.
 3. Commit, then tag: `git tag -a vX.Y.Z -m "..."` and `git push origin main --follow-tags`.
 4. Update the moving major tag so Action users can pin `@vX`:

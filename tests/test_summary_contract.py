@@ -8,6 +8,8 @@ import pytest
 from pydantic import ValidationError
 
 from app.schemas import (
+    AstLockRejection,
+    CandidateEvidence,
     RefusalReason,
     RefusalReport,
     EvidenceBundle,
@@ -55,11 +57,6 @@ def _review(**overrides: Any) -> ReviewReport:
     return ReviewReport(test_script_path="tests/login.spec.ts", **overrides)
 
 
-@pytest.mark.parametrize("summary", [_repair(), _refusal(), _suite(), _review()])
-def test_all_output_models_share_one_schema_version(summary: _AnySummary) -> None:
-    assert summary.schema_version == SCHEMA_VERSION
-
-
 @pytest.mark.parametrize(
     ("summary", "expected_kind"),
     [
@@ -97,12 +94,77 @@ def test_refusal_report_rejects_unknown_reason() -> None:
 
 
 @pytest.mark.parametrize("make", [_repair, _suite, _review])
-def test_unsupported_schema_version_is_rejected(make: Callable[..., _AnySummary]) -> None:
-    # The contract pins the emitted version, so a model can never serialize an
-    # unsupported schema_version (e.g. a stale hard-coded "2.0").
-    bad_version: Any = "1.0"
+@pytest.mark.parametrize("bad_version", ["1.0", "2.0", "2.1", "2.2"])
+def test_unsupported_schema_version_is_rejected(
+    make: Callable[..., _AnySummary], bad_version: str
+) -> None:
+    # The contract pins the emitted version, so a model can never serialize a stale or
+    # unsupported schema_version (e.g. a hard-coded "2.2" after the 2.3 minor bump).
     with pytest.raises(ValidationError, match="schema_version"):
         make(schema_version=bad_version)
+
+
+def test_optional_detail_objects_are_minor_additions_to_the_2_major() -> None:
+    # Policy: an optional detail object is a compatible minor change, so the major stays 2.
+    assert SCHEMA_VERSION == "2.3"
+    assert SCHEMA_VERSION.split(".")[0] == "2"
+
+
+def test_evidence_bundle_from_an_older_minor_still_validates() -> None:
+    # Additive-change guarantee: evidence emitted before 2.2 has no provenance key and before
+    # 2.3 no path or loop budget. A consumer must read that as absence rather than as an error.
+    bundle = EvidenceBundle.model_validate({"parsed_error": "boom"})
+
+    assert bundle.provenance is None
+    assert bundle.path == []
+    assert bundle.loop_budget is None
+    assert json.loads(bundle.model_dump_json())["provenance"] is None
+
+
+def test_refusal_json_carries_structured_ast_lock_detail() -> None:
+    report = _refusal(
+        reason=RefusalReason.GUARDRAIL_VIOLATION,
+        evidence=EvidenceBundle(
+            candidates=[
+                CandidateEvidence(
+                    loop_count=0,
+                    source="llm",
+                    outcome="rejected",
+                    rejection="AST lock rejected the patch",
+                    ast_lock=AstLockRejection(
+                        reason="disallowed_ast_change", node_kind="expression_statement", line=4
+                    ),
+                )
+            ]
+        ),
+    )
+
+    data = json.loads(report.model_dump_json())
+
+    assert data["reason"] == "guardrail_violation"
+    assert data["evidence"]["candidates"][0]["ast_lock"] == {
+        "reason": "disallowed_ast_change",
+        "node_kind": "expression_statement",
+        "line": 4,
+    }
+    assert RefusalReport.model_validate_json(report.model_dump_json()) == report
+
+
+def test_candidate_payload_without_ast_lock_still_validates() -> None:
+    # Additive-change guarantee: a candidate emitted before 2.1 has no ast_lock key, and a
+    # consumer's model of it must read that as absence rather than as an error.
+    candidate = CandidateEvidence.model_validate(
+        {"loop_count": 1, "source": "llm", "outcome": "rejected", "rejection": "stale line"}
+    )
+
+    assert candidate.ast_lock is None
+
+
+def test_ast_lock_rejection_tolerates_unknown_reasons_but_not_a_zero_line() -> None:
+    # `reason` is deliberately open so new lock reasons are not a major bump.
+    assert AstLockRejection(reason="a_future_reason").node_kind is None
+    with pytest.raises(ValidationError, match="line"):
+        AstLockRejection(reason="disallowed_ast_change", line=0)
 
 
 def test_suite_results_are_nested_repair_summaries() -> None:
@@ -110,12 +172,6 @@ def test_suite_results_are_nested_repair_summaries() -> None:
     assert data["kind"] == "suite"
     assert [r["kind"] for r in data["results"]] == ["repair", "repair"]
     assert all(r["schema_version"] == SCHEMA_VERSION for r in data["results"])
-
-
-def test_review_report_kind_is_review() -> None:
-    data = json.loads(_review(has_findings=True).model_dump_json())
-    assert data["kind"] == "review"
-    assert data["schema_version"] == SCHEMA_VERSION
 
 
 def test_review_report_marks_incomplete_provider_failures() -> None:

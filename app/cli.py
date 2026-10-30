@@ -4,6 +4,9 @@ import difflib
 import json
 import os
 import subprocess
+import tempfile
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import cast
 
@@ -12,6 +15,15 @@ import typer
 from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 from rich.syntax import Syntax
 from rich.table import Table
 from typer.core import TyperGroup
@@ -22,11 +34,27 @@ from app.graph import build_graph, build_review_graph
 from app.healing_history import append_record, make_record
 from app.logging import configure_logging
 from app.notifications import notify_heal_outcome
+from app.preprocess.ambiguous_target import ambiguous_replacements
 from app.preprocess.aria_snapshot import read_failure_snapshot, read_failure_snapshot_with_source
 from app.preprocess.diff_ast_analyzer import analyze_diff
 from app.preprocess.error_log_parser import parse_error_log
 from app.preprocess.failure_scanner import scan_failing_tests
+from app.preprocess.selector_diff_check import untouched_failing_selector
 from app.runner import run_playwright
+from app.safety_benchmark import (
+    ActualOutcome,
+    GateStatus,
+    ScenarioRestoreError,
+    ScenarioSandboxError,
+    assert_scenarios_writable,
+    discover_safety_scenarios,
+    execute_prepared_scenario,
+    execute_safety_scenario,
+    SafetyScenarioResult,
+    run_safety_benchmark,
+)
+from app.safety_parallel import ParallelSetupError, run_parallel_safety_benchmark
+from app.safety_report import load_baseline, render_markdown, shortfall_summary
 from app.sandbox import (
     SandboxViolation,
     assert_auto_discovered_target,
@@ -185,6 +213,8 @@ def _heal_file(
     dom_diff_context: list[dict],
     dry_run: bool,
     memory_enabled: bool = True,
+    *,
+    diff_text: str = "",
 ) -> HealResult:
     assert_read_allowed(test_path)
     assert_write_allowed(test_path, reason="repair_target")
@@ -200,6 +230,8 @@ def _heal_file(
         "rollback_code": original_code,
         "error_log": parsed_error_log,
         "dom_diff_context": dom_diff_context,
+        "untouched_selector": untouched_failing_selector(raw_log, diff_text),
+        "ambiguous_candidates": ambiguous_replacements(raw_log, dom_diff_context),
         "dom_snapshot": dom_snapshot,
         "dom_snapshot_source": str(snapshot_source) if snapshot_source else "",
         "analysis_report": "",
@@ -263,6 +295,8 @@ def _heal_file(
             "repair_run_finished",
             is_success=final_state["is_success"],
             loop_count=final_state["loop_count"],
+            loop_budget=settings.max_loops,
+            termination=summary.termination,
         )
         return summary
     finally:
@@ -275,6 +309,8 @@ def _heal_suite(
     dom_diff_context: list[dict],
     dry_run: bool,
     memory_enabled: bool = True,
+    *,
+    diff_text: str = "",
 ) -> SuiteSummary:
     passed, raw_log = run_playwright(suite_target)
     if passed:
@@ -326,7 +362,9 @@ def _heal_suite(
             results.append(result)
             result_by_rel[rel] = result
             continue
-        result = _heal_file(resolved, focused_log, dom_diff_context, dry_run, memory_enabled)
+        result = _heal_file(
+            resolved, focused_log, dom_diff_context, dry_run, memory_enabled, diff_text=diff_text
+        )
         results.append(result)
         result_by_rel[rel] = result
 
@@ -516,7 +554,8 @@ def heal(
                 console.print(f"[red]Invalid --selector-hint JSON:[/red] {escape(str(e))}")
                 raise typer.Exit(code=2)
 
-        dom_diff_context = [d.model_dump() for d in analyze_diff(_read_diff(diff_file, diff_base))]
+        diff_text = _read_diff(diff_file, diff_base)
+        dom_diff_context = [d.model_dump() for d in analyze_diff(diff_text)]
 
         # Now inject the already-validated hint into context
         if parsed_hint is not None:
@@ -542,7 +581,9 @@ def heal(
                 if passed:
                     console.print("[green]test already passes[/green] — nothing to heal")
                     raise typer.Exit(code=0)
-            summary = _heal_file(test_path, raw_log, dom_diff_context, dry_run, memory_enabled)
+            summary = _heal_file(
+                test_path, raw_log, dom_diff_context, dry_run, memory_enabled, diff_text=diff_text
+            )
             if json_output:
                 typer.echo(summary.model_dump_json())
 
@@ -560,6 +601,7 @@ def heal(
             dom_diff_context,
             dry_run,
             memory_enabled,
+            diff_text=diff_text,
         )
         # Emit JSON before early exits.
         if json_output:
@@ -635,6 +677,184 @@ def review(
     except SandboxViolation as exc:
         console.print(f"[red]sandbox denied:[/red] {escape(str(exc))}")
         raise typer.Exit(code=2) from exc
+
+
+def _write_report_file(path: Path, content: str) -> None:
+    """Write a benchmark output file. These are harness artifacts, not repair-target writes."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+
+
+@app.command()
+def safety_benchmark(
+    scenario_root: Path = typer.Option(
+        Path("examples/scenarios"),
+        "--scenario-root",
+        help="Directory containing labeled scenario subdirectories.",
+    ),
+    apply_patches: bool = typer.Option(
+        False,
+        "--apply-patches/--no-apply-patches",
+        help=(
+            "Apply each scenario's change.patch before running it and reverse it afterwards, so "
+            "the benchmark breaks the demo app itself. Without this, scenarios must already be "
+            "broken. Needs a git checkout with the app files unmodified."
+        ),
+    ),
+    output: Path | None = typer.Option(
+        None, "--output", help="Also write the JSON report to this file (diffable; baselines)."
+    ),
+    markdown: Path | None = typer.Option(
+        None, "--markdown", help="Also write a Markdown summary to this file."
+    ),
+    baseline: Path | None = typer.Option(
+        None,
+        "--baseline",
+        help=(
+            "A previous JSON report to compare against in the Markdown summary. A missing file "
+            "means no baseline yet; an invalid one is an error."
+        ),
+    ),
+    enforce_gates: bool = typer.Option(
+        False,
+        "--enforce-gates",
+        help="Exit 1 when a release gate fails. For release checks only, never merge gating.",
+    ),
+    repeat: int = typer.Option(
+        1,
+        "--repeat",
+        min=1,
+        max=10,
+        help=(
+            "Run every scenario this many times and report how often each outcome happened. "
+            "Model output varies between runs, so one run can mislead. Costs this many times "
+            "the model calls. Repeats reduce noise; they do not count as extra scenarios for the "
+            "release gates."
+        ),
+    ),
+    jobs: int = typer.Option(
+        1,
+        "--jobs",
+        min=1,
+        max=8,
+        help=(
+            "Run this many scenarios at once, each in its own copy of the Playwright project "
+            "(the current directory) with its own preview port. Needs --apply-patches. Each "
+            "worker's output goes to a log file whose directory is printed when the run starts."
+        ),
+    ),
+) -> None:
+    """Run the opt-in repair/refusal safety benchmark and print a stable JSON report.
+
+    Informational by default: it exits 0 whenever the run completes, whatever the scores. With
+    ``--enforce-gates`` it exits 1 when a release gate fails (#292); a gate whose sample is
+    still too small is reported but never fails.
+    """
+    # Without this, structlog's defaults apply in this process: tracebacks with every frame's
+    # locals, no redaction, and logs on stdout (#413). Parallel workers configure their own.
+    configure_logging(settings.log_level)
+    if not scenario_root.is_dir():
+        console.print(f"[red]scenario root does not exist:[/red] {escape(str(scenario_root))}")
+        raise typer.Exit(code=2)
+    previous = None
+    if baseline is not None:
+        try:
+            previous = load_baseline(baseline)
+        except ValueError as exc:
+            console.print(f"[red]{escape(str(exc))}[/red]")
+            raise typer.Exit(code=2) from exc
+        if previous is None:
+            console.print(
+                f"[yellow]no baseline at {escape(str(baseline))}; skipping deltas[/yellow]"
+            )
+    try:
+        scenarios = discover_safety_scenarios(scenario_root)
+    except ValueError as exc:
+        # Includes pydantic's ValidationError: an unknown class or a missing field in meta.json.
+        console.print(f"[red]invalid scenario corpus:[/red] {escape(str(exc))}")
+        raise typer.Exit(code=2) from exc
+    try:
+        assert_scenarios_writable(scenarios)
+    except ScenarioSandboxError as exc:
+        console.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(code=2) from exc
+    if jobs > 1 and not apply_patches:
+        console.print("[red]--jobs above 1 needs --apply-patches[/red]")
+        raise typer.Exit(code=2)
+    executor = execute_prepared_scenario if apply_patches else execute_safety_scenario
+    runs = sum(1 for scenario in scenarios if scenario.runnable) * repeat
+    try:
+        with _benchmark_progress(runs, jobs) as on_result:
+            if jobs > 1:
+                log_dir = Path(tempfile.mkdtemp(prefix="e2e-healer-safety-logs-"))
+                # Named up front so a run that aborts still says where its workers logged.
+                console.print(f"[dim]worker logs: {escape(str(log_dir))}[/dim]")
+                report = run_parallel_safety_benchmark(
+                    scenarios, jobs=jobs, repeats=repeat, on_result=on_result, log_dir=log_dir
+                )
+            else:
+                report = run_safety_benchmark(
+                    scenarios, executor, repeats=repeat, on_result=on_result
+                )
+    except ScenarioRestoreError as exc:
+        # The working tree is still modified, so continuing would benchmark a wrong app.
+        console.print(f"[red]aborting, working tree not restored:[/red] {escape(str(exc))}")
+        raise typer.Exit(code=1) from exc
+    except ParallelSetupError as exc:
+        # A corpus a parallel run cannot copy (a patch outside the project, wrong directory).
+        console.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(code=2) from exc
+    json_report = report.model_dump_json(indent=2)
+    if output is not None:
+        _write_report_file(output, json_report + "\n")
+    if markdown is not None:
+        _write_report_file(markdown, render_markdown(report, previous))
+    typer.echo(json_report)
+    # A gate below its minimum sample is reported and never enforced, so say by how much it
+    # is short: otherwise the terminal only ever shows a run that looked like it passed.
+    shortfall = shortfall_summary(report.gates)
+    if shortfall is not None:
+        console.print(f"[yellow]{escape(shortfall)}[/yellow]")
+    failed = [gate.name for gate in report.gates if gate.status is GateStatus.FAIL]
+    if enforce_gates and failed:
+        console.print(f"[red]release gates failed:[/red] {escape(', '.join(failed))}")
+        raise typer.Exit(code=1)
+
+
+@contextmanager
+def _benchmark_progress(runs: int, jobs: int) -> Iterator[Callable[[SafetyScenarioResult], None]]:
+    """Show a live bar on stderr and print one line per finished run; yield the callback."""
+    columns = (
+        SpinnerColumn(),
+        TextColumn("[bold]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        TextColumn("eta"),
+        TimeRemainingColumn(),
+    )
+    label = f"safety benchmark, {jobs} workers" if jobs > 1 else "safety benchmark"
+    with Progress(*columns, console=console, transient=False) as progress:
+        task = progress.add_task(label, total=runs)
+
+        def on_result(result: SafetyScenarioResult) -> None:
+            expected = result.expected_outcome.value
+            actual = result.actual_outcome.value
+            if result.actual_outcome is ActualOutcome.ERROR:
+                mark = "[yellow]![/yellow]"
+            elif actual == expected:
+                mark = "[green]✓[/green]"
+            else:
+                mark = "[red]✗[/red]"
+            reason = f" ({result.refusal_reason})" if result.refusal_reason else ""
+            progress.console.print(
+                f"{mark} {escape(result.name)}: {actual}{escape(reason)}, expected {expected} "
+                f"[dim]{result.latency_seconds:.1f}s[/dim]",
+                soft_wrap=True,
+            )
+            progress.advance(task)
+
+        yield on_result
 
 
 @app.command()
@@ -776,16 +996,46 @@ def init(
         else:
             try:
                 WORKFLOW_TARGET_PATH.parent.mkdir(parents=True, exist_ok=True)
-                yaml_template = """name: E2E Self-Healing CI
+                yaml_template = """name: E2E repair review gate
+
 on:
-  push:
-    branches: [ main ]
+  pull_request:
+
+permissions:
+  contents: read
+
 jobs:
-  heal:
+  review-e2e-failure:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # add steps to invoke e2e-healer
+      # Install your project's Node dependencies and Playwright browser before this step.
+      - name: Install project dependencies
+        run: npm ci
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+      - name: Review a failing E2E test
+        id: healer
+        uses: Lee-Dongwook/E2E-Self-Heal@v0.4.0
+        with:
+          # Replace this with the test path reported by your failing suite.
+          test-path: tests/example.spec.ts
+          # Review mode is read-only: it never changes test code.
+          mode: review
+          nvidia-api-key: ${{ secrets.NVIDIA_API_KEY }}
+          diff-base: ${{ github.event.pull_request.base.sha }}
+      - name: Verify the full E2E suite
+        run: npx playwright test
+      - name: Retain repair or refusal evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-healer-evidence
+          path: |
+            repair-summary.json
+            review.json
+            playwright.log
+          if-no-files-found: ignore
 """
                 WORKFLOW_TARGET_PATH.write_text(yaml_template)
                 console.print(

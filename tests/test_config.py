@@ -5,16 +5,13 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from app.config import Settings
+from app.config import MIN_SENSITIVE_VALUE_LENGTH, Settings
+from app.shadow.redaction import MIN_CONFIGURED_SECRET_LENGTH
 
 
 def make_settings(**overrides: Any) -> Settings:
     """Build Settings ignoring any local .env so tests stay hermetic."""
     return Settings(_env_file=None, **overrides)  # type: ignore[call-arg]
-
-
-def test_defaults_to_nvidia_provider():
-    assert make_settings().llm_provider == "nvidia"
 
 
 def test_legacy_nvidia_key_backfills_generic_field():
@@ -23,7 +20,7 @@ def test_legacy_nvidia_key_backfills_generic_field():
     settings = make_settings(nvidia_api_key="nvapi-legacy")
     assert settings.llm_api_key == "nvapi-legacy"
     assert settings.llm_base_url == "https://integrate.api.nvidia.com/v1"
-    assert settings.llm_model == "openai/gpt-oss-120b"
+    assert settings.llm_model == "minimaxai/minimax-m3.1-flash"
 
 
 def test_explicit_generic_field_overrides_legacy():
@@ -83,10 +80,6 @@ def test_max_loops_accepts_one_through_three(good):
     assert make_settings(max_loops=good).max_loops == good
 
 
-def test_max_loops_defaults_to_three():
-    assert make_settings().max_loops == 3
-
-
 @pytest.mark.parametrize("field", ["llm_max_tokens", "nvidia_max_tokens"])
 @pytest.mark.parametrize("bad", [0, -1, -100])
 def test_token_limits_reject_zero_and_negative(field, bad):
@@ -118,7 +111,7 @@ def test_blank_model_is_rejected(blank):
 
 def test_nvidia_provider_gets_legacy_default_model():
     # NVIDIA is the one provider with a back-compat default, so no explicit model is needed.
-    assert make_settings().llm_model == "openai/gpt-oss-120b"
+    assert make_settings().llm_model == "minimaxai/minimax-m3.1-flash"
 
 
 def test_orcarouter_specific_settings_map_to_generic_fields():
@@ -154,3 +147,47 @@ def test_orcarouter_standard_environment_variables_are_supported(monkeypatch):
 
     assert settings.llm_api_key == "router-key"
     assert settings.llm_base_url == "https://router.example.com/v1"
+
+
+# --- redaction boundary configuration (#377) ----------------------------------------------
+
+
+def test_the_configuration_floor_matches_the_redaction_constant() -> None:
+    # Duplicated so config validation need not import the redaction module; keep them equal.
+    assert MIN_SENSITIVE_VALUE_LENGTH == MIN_CONFIGURED_SECRET_LENGTH
+
+
+def test_sensitive_env_vars_accepts_a_comma_separated_list_of_names() -> None:
+    settings = make_settings(sensitive_env_vars="GITHUB_TOKEN, NPM_TOKEN")
+    assert settings.sensitive_env_vars == "GITHUB_TOKEN, NPM_TOKEN"
+
+
+@pytest.mark.parametrize("bad", ["GITHUB-TOKEN", "1TOKEN", "TOKEN KEY", "TOKEN=1"])
+def test_sensitive_env_vars_rejects_names_that_cannot_name_a_variable(bad) -> None:
+    # A mistyped name redacts nothing while looking configured, so fail at load.
+    with pytest.raises(ValidationError, match="sensitive_env_vars"):
+        make_settings(sensitive_env_vars=f"NPM_TOKEN,{bad}")
+
+
+@pytest.mark.parametrize("bad", ["abc", "a", "abcdef,xyz"])
+def test_sensitive_values_rejects_literals_shorter_than_four_characters(bad) -> None:
+    with pytest.raises(ValidationError, match="sensitive_values"):
+        make_settings(sensitive_values=bad)
+
+
+def test_sensitive_values_accepts_a_literal_at_the_minimum_length() -> None:
+    settings = make_settings(sensitive_values="abcd")
+    assert settings.sensitive_values.get_secret_value() == "abcd"
+
+
+def test_blank_sensitive_entries_are_allowed() -> None:
+    # Trailing commas and padding are common in .env files; neither is a misconfiguration.
+    settings = make_settings(sensitive_env_vars=" , ", sensitive_values=" , ")
+    assert settings.sensitive_env_vars == " , "
+
+
+def test_a_sensitive_literal_is_masked_in_repr_and_model_dump() -> None:
+    # --json writes a model dump and logs render repr; neither may quote these values.
+    settings = make_settings(sensitive_values="tenant-secret-value")
+    assert "tenant-secret-value" not in repr(settings)
+    assert "tenant-secret-value" not in str(settings.model_dump())

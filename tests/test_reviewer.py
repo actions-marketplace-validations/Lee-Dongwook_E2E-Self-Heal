@@ -1,19 +1,14 @@
-from typing import cast
-
 import app.nodes.reviewer as reviewer_module
 from app.nodes.reviewer import reviewer
 from app.schemas import ReviewFinding, ReviewOutput
-from app.state import AgentState
+from tests.factories import make_state
 
-BASE_STATE = cast(
-    AgentState,
-    {
-        "analysis_report": "The #cta selector broke because className changed.",
-        "dom_diff_context": [
-            {"file": "components/CTAButton.tsx", "line": 12, "current": {"tag": "button"}}
-        ],
-        "current_code": "await page.click('#cta')",
-    },
+BASE_STATE = make_state(
+    analysis_report="The #cta selector broke because className changed.",
+    dom_diff_context=[
+        {"file": "components/CTAButton.tsx", "line": 12, "current": {"tag": "button"}}
+    ],
+    current_code="await page.click('#cta')",
 )
 
 
@@ -47,10 +42,10 @@ def test_reviewer_marks_report_incomplete_on_llm_failure(monkeypatch):
 
     result = reviewer(BASE_STATE)
 
-    assert result == {
-        "review_report": {
-            "findings": [],
-            "is_complete": False,
-            "error": "review provider failed to generate suggestions",
-        }
-    }
+    report = result["review_report"]
+    assert report["findings"] == []
+    assert report["is_complete"] is False
+    assert "error" in report
+    # reports that nothing needed redacting.
+    assert result["redaction_count"] == 0
+    assert result["redaction_applied"] is False

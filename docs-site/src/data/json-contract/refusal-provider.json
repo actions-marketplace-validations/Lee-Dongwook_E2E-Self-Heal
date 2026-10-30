@@ -1,0 +1,276 @@
+{
+  "schema_version": "2.3",
+  "kind": "refusal",
+  "test_script_path": "scenarios/id-rename/spec.ts",
+  "reason": "provider_error",
+  "is_success": false,
+  "loop_count": 3,
+  "evidence": {
+    "parsed_error": "call log: locator('#submit-btn')",
+    "failing_selector": "#submit-btn",
+    "dom_diff_context": [
+      {
+        "file": "examples/demo-app/src/components/SubmitButton.tsx",
+        "line": 3,
+        "previous": {
+          "tag": "button",
+          "attributes": {
+            "id": "submit-btn",
+            "className": "btn",
+            "type": "submit"
+          }
+        },
+        "current": {
+          "tag": "button",
+          "attributes": {
+            "id": "submit",
+            "className": "btn",
+            "type": "submit"
+          }
+        }
+      }
+    ],
+    "aria_snapshot": {
+      "sha256": "639d4fd977c9486e9e1d5e134c639e37e0174568ee4b934138599068ae501a84",
+      "source_path": "test-results/id-rename-spec.ts-submits-the-form/error-context.md",
+      "chars": 705
+    },
+    "candidates": [],
+    "loop_history": [
+      {
+        "loop_count": 0,
+        "stage": "memory_lookup",
+        "outcome": "disabled",
+        "details": {
+          "score": null,
+          "error": null,
+          "instruction_count": null,
+          "reason": null
+        }
+      },
+      {
+        "loop_count": 0,
+        "stage": "patch_generator",
+        "outcome": "provider_failed",
+        "details": {
+          "score": null,
+          "error": null,
+          "instruction_count": null,
+          "reason": null
+        }
+      },
+      {
+        "loop_count": 0,
+        "stage": "shadow_verifier",
+        "outcome": "skipped",
+        "details": {
+          "score": null,
+          "error": null,
+          "instruction_count": null,
+          "reason": null
+        }
+      },
+      {
+        "loop_count": 0,
+        "stage": "selector_verifier",
+        "outcome": "skipped",
+        "details": {
+          "score": null,
+          "error": null,
+          "instruction_count": null,
+          "reason": null
+        }
+      },
+      {
+        "loop_count": 0,
+        "stage": "test_runner",
+        "outcome": "failed",
+        "details": {
+          "score": null,
+          "error": null,
+          "instruction_count": null,
+          "reason": null
+        }
+      },
+      {
+        "loop_count": 1,
+        "stage": "patch_generator",
+        "outcome": "provider_failed",
+        "details": {
+          "score": null,
+          "error": null,
+          "instruction_count": null,
+          "reason": null
+        }
+      },
+      {
+        "loop_count": 1,
+        "stage": "shadow_verifier",
+        "outcome": "skipped",
+        "details": {
+          "score": null,
+          "error": null,
+          "instruction_count": null,
+          "reason": null
+        }
+      },
+      {
+        "loop_count": 1,
+        "stage": "selector_verifier",
+        "outcome": "skipped",
+        "details": {
+          "score": null,
+          "error": null,
+          "instruction_count": null,
+          "reason": null
+        }
+      },
+      {
+        "loop_count": 1,
+        "stage": "test_runner",
+        "outcome": "failed",
+        "details": {
+          "score": null,
+          "error": null,
+          "instruction_count": null,
+          "reason": null
+        }
+      },
+      {
+        "loop_count": 2,
+        "stage": "patch_generator",
+        "outcome": "provider_failed",
+        "details": {
+          "score": null,
+          "error": null,
+          "instruction_count": null,
+          "reason": null
+        }
+      },
+      {
+        "loop_count": 2,
+        "stage": "shadow_verifier",
+        "outcome": "skipped",
+        "details": {
+          "score": null,
+          "error": null,
+          "instruction_count": null,
+          "reason": null
+        }
+      },
+      {
+        "loop_count": 2,
+        "stage": "selector_verifier",
+        "outcome": "skipped",
+        "details": {
+          "score": null,
+          "error": null,
+          "instruction_count": null,
+          "reason": null
+        }
+      },
+      {
+        "loop_count": 2,
+        "stage": "test_runner",
+        "outcome": "failed",
+        "details": {
+          "score": null,
+          "error": null,
+          "instruction_count": null,
+          "reason": null
+        }
+      },
+      {
+        "loop_count": 3,
+        "stage": "refusal_finalizer",
+        "outcome": "refused",
+        "details": {
+          "score": null,
+          "error": null,
+          "instruction_count": null,
+          "reason": "provider_error"
+        }
+      }
+    ],
+    "provenance": {
+      "provider": "anthropic",
+      "model": "claude-sonnet-4-6",
+      "endpoint": "https://api.anthropic.com",
+      "mode": "remote",
+      "redaction_applied": false,
+      "redaction_count": 0
+    },
+    "path": [
+      {
+        "node": "memory_lookup",
+        "loop_count": 0
+      },
+      {
+        "node": "diagnoser",
+        "loop_count": 0
+      },
+      {
+        "node": "patch_generator",
+        "loop_count": 0
+      },
+      {
+        "node": "shadow_verifier",
+        "loop_count": 0
+      },
+      {
+        "node": "selector_verifier",
+        "loop_count": 0
+      },
+      {
+        "node": "test_runner",
+        "loop_count": 1
+      },
+      {
+        "node": "diagnoser",
+        "loop_count": 1
+      },
+      {
+        "node": "patch_generator",
+        "loop_count": 1
+      },
+      {
+        "node": "shadow_verifier",
+        "loop_count": 1
+      },
+      {
+        "node": "selector_verifier",
+        "loop_count": 1
+      },
+      {
+        "node": "test_runner",
+        "loop_count": 2
+      },
+      {
+        "node": "diagnoser",
+        "loop_count": 2
+      },
+      {
+        "node": "patch_generator",
+        "loop_count": 2
+      },
+      {
+        "node": "shadow_verifier",
+        "loop_count": 2
+      },
+      {
+        "node": "selector_verifier",
+        "loop_count": 2
+      },
+      {
+        "node": "test_runner",
+        "loop_count": 3
+      },
+      {
+        "node": "refusal_finalizer",
+        "loop_count": 3
+      }
+    ],
+    "loop_budget": 3
+  },
+  "termination": "refused"
+}

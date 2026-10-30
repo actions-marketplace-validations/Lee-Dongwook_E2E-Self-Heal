@@ -6,7 +6,7 @@ each node reads from it and returns a partial update dict.
 
 from typing import Literal, NotRequired, TypedDict
 
-from app.schemas import RefusalReason
+from app.schemas import DiagnosisVerdict, RefusalReason
 
 
 class PatchApplicationReport(TypedDict):
@@ -45,6 +45,14 @@ class EvidenceInstructionRecord(TypedDict):
     selector: str
 
 
+class EvidenceAstLockRecord(TypedDict):
+    """Serialized AST lock verdict retained on a rejected candidate."""
+
+    reason: str
+    node_kind: str | None
+    line: int | None
+
+
 class EvidenceCandidateRecord(TypedDict):
     """One ordered candidate record captured while traversing the repair graph."""
 
@@ -57,6 +65,16 @@ class EvidenceCandidateRecord(TypedDict):
     shadow_score: NotRequired[float]
     selector_counts: NotRequired[dict[str, int]]
     test_passed: NotRequired[bool]
+    ast_lock: NotRequired[EvidenceAstLockRecord]
+    # Graph node the run moved to once this candidate was accepted or rejected (graph.py).
+    next_step: NotRequired[str]
+
+
+class GraphStepRecord(TypedDict):
+    """One node the repair graph executed, appended by the wrapper in ``build_graph``."""
+
+    node: str
+    loop_count: int
 
 
 class EvidenceLoopDetails(TypedDict, total=False):
@@ -93,9 +111,18 @@ class AgentState(TypedDict):
     rollback_code: NotRequired[str]
     error_log: str  # latest Playwright error log (abstracted)
     dom_diff_context: list[dict]  # DOM changes from AST parsing
+    # The failing locator when the diff removes no line naming it (selector_diff_check), else
+    # absent or "". A fact for the prompts: the selector was not renamed, so it is not the fix.
+    untouched_selector: NotRequired[str]
+    # Selectors of the look-alikes that replaced the failing element (ambiguous_target), else
+    # absent or []. Non-empty means the test cannot say which one it meant: refused up front.
+    ambiguous_candidates: NotRequired[list[str]]
     dom_snapshot: str  # ARIA snapshot of the failing page (from error-context.md)
     dom_snapshot_source: NotRequired[str]  # source error-context.md path for evidence references
     analysis_report: str  # Diagnoser's failure-cause report
+    # Decline Adjudicator's verdict about a candidate that proposed no change. Absent until the
+    # model declines, and absent for the rest of the run when the verdict could not be obtained.
+    diagnosis_verdict: NotRequired[DiagnosisVerdict]
     memory_enabled: NotRequired[bool]  # opt in/out of local healing-history lookup and storage
     detected_framework: NotRequired[str]  # optional framework hint for prompt strategy selection
     patch_instructions: dict  # Patch Generator's fix guide (line, code)
@@ -109,5 +136,10 @@ class AgentState(TypedDict):
     refusal_reason: NotRequired[RefusalReason]  # exact reason for a terminal repair refusal
     evidence_candidates: NotRequired[list[EvidenceCandidateRecord]]
     evidence_history: NotRequired[list[EvidenceLoopRecord]]
+    graph_path: NotRequired[list[GraphStepRecord]]  # every executed node, in order
+    # Number of values the evidence boundary replaced while preparing model prompts, and whether
+    # anything was replaced at all. Reported in the result as provider provenance.
+    redaction_count: NotRequired[int]
+    redaction_applied: NotRequired[bool]
     loop_count: int  # infinite-loop guard (max: settings.max_loops)
     is_success: bool  # whether the test passed

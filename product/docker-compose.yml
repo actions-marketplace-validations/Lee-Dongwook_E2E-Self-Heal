@@ -1,0 +1,33 @@
+# Local development database for product/api. Credentials are for local use only.
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: product/api/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      PRODUCT_API_DATABASE_URL: postgresql+psycopg://product:product@postgres:5432/product
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: product
+      POSTGRES_PASSWORD: product
+      POSTGRES_DB: product
+    ports:
+      # Override with PRODUCT_DB_PORT if a local Postgres already uses 5432.
+      - "${PRODUCT_DB_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U product -d product"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+volumes:
+  postgres-data:

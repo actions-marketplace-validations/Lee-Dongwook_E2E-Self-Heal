@@ -1,0 +1,19 @@
+{
+  "schema_version": "2.3",
+  "kind": "review",
+  "test_script_path": "scenarios/id-rename/spec.ts",
+  "findings": [
+    {
+      "file": "examples/demo-app/src/components/SubmitButton.tsx",
+      "line": 3,
+      "broken_selector": "#submit-btn",
+      "root_cause": "The `id` attribute on the <button> element was renamed from `submit-btn` to `submit`, so the CSS ID selector `#submit-btn` no longer matches any element in the DOM.",
+      "suggestion": "Avoid coupling tests to `id` attributes, which are volatile and can be renamed without warning. Instead, (1) add a stable `data-testid=\"submit-btn\"` attribute to the button in SubmitButton.tsx so tests are insulated from `id`/`className` churn, OR (2) rely on the button's semantic role and accessible name (\"Submit\"), which are already present in the ARIA snapshot and are inherently stable. The preferred Playwright locator is `page.getByRole('button', { name: 'Submit' })` — it requires no source changes and aligns with accessibility best practices. If a test-hook attribute is preferred for disambiguation, add `data-testid=\"submit-btn\"` to the button element and use `page.getByTestId('submit-btn')`.",
+      "recommended_selector": "page.getByRole('button', { name: 'Submit' })",
+      "severity": "warning"
+    }
+  ],
+  "has_findings": true,
+  "is_complete": true,
+  "error": null
+}
